@@ -1,0 +1,89 @@
+{
+  "entities": {
+    "users": {
+      "title": "User",
+      "description": "A verified user profile in Gatekeeper Universal Chat.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "username": { "type": "string" },
+        "email": { "type": "string" },
+        "emailVerified": { "type": "boolean" },
+        "groups": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["uid", "name", "username", "email", "emailVerified", "groups"]
+    },
+    "groups": {
+      "title": "Group",
+      "description": "A custom chat room where discussions must match the topic of the group name and description.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "members": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["id", "name", "description", "members", "createdBy"]
+    },
+    "messages": {
+      "title": "Message",
+      "description": "A moderated chat message or attachment file.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "groupId": { "type": "string" },
+        "recipientId": { "type": "string" },
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "senderEmail": { "type": "string" },
+        "text": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "fileUrl": { "type": "string" },
+        "fileName": { "type": "string" },
+        "fileType": { "type": "string" },
+        "fileDescription": { "type": "string" },
+        "friendlyPoliteFilter": { "type": "boolean" },
+        "replyToId": { "type": "string" },
+        "replyToSenderName": { "type": "string" },
+        "replyToText": { "type": "string" },
+        "isForwarded": { "type": "boolean" },
+        "originalSenderName": { "type": "string" }
+      },
+      "required": ["id", "senderId", "senderName", "timestamp"]
+    },
+    "notifications": {
+      "title": "Notification",
+      "description": "Moderation alerts or system warnings issued to users.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "messageId": { "type": "string" },
+        "messageText": { "type": "string" },
+        "explanation": { "type": "string" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["id", "userId", "messageId", "messageText", "explanation", "timestamp"]
+    },
+    "logs": {
+      "title": "Log",
+      "description": "Audit trail log of Gatekeeper moderator actions.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "type": { "type": "string" },
+        "details": { "type": "string" }
+      },
+      "required": ["id", "timestamp", "type", "details"]
+    }
+  }
+}

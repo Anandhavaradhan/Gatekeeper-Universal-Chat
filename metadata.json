@@ -1,0 +1,6 @@
+{
+  "name": "Gatekeeper Universal Chat",
+  "description": "An all-purpose WhatsApp-like real-time chat with groups and DMs, featuring dynamic group topic matching and optional DM polite language filters powered by Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
