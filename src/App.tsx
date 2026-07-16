@@ -1600,14 +1600,14 @@ export default function App() {
       )}
 
       {/* Top Main Navigation Header */}
-      <header id="app-header" className="flex items-center justify-between px-6 py-4 bg-white border-b border-slate-200 shrink-0">
+      <header id="app-header" className={`flex items-center justify-between px-6 py-4 shrink-0 transition-colors ${!currentUser ? "bg-slate-50 border-b border-slate-50" : "bg-white border-b border-slate-200"}`}>
         <div className="flex items-start sm:items-center gap-3">
-          <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 to-sky-500 shadow-md shadow-sky-500/10 shrink-0">
-            <BookOpen className="w-5 h-5 text-white" />
+          <div className="flex items-center justify-center w-11 sm:w-12 h-11 sm:h-12 rounded-xl bg-gradient-to-tr from-indigo-500 to-sky-500 shadow-md shadow-sky-500/10 shrink-0">
+            <BookOpen className="w-5 sm:w-6 h-5 sm:h-6 text-white" />
           </div>
           <div>
             <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2">
-              <h1 className="text-sm font-bold tracking-tight text-slate-900">Gatekeeper Universal Chat</h1>
+              <h1 className="text-lg sm:text-xl font-extrabold tracking-tight text-slate-900">Gatekeeper Universal Chat</h1>
               <span className="inline-block w-fit px-2 py-0.5 text-[8px] sm:text-[9px] font-extrabold bg-indigo-50 text-indigo-700 rounded-full border border-indigo-150 uppercase tracking-wide whitespace-nowrap">
                 Topic-Enforced Platform
               </span>
@@ -1622,7 +1622,7 @@ export default function App() {
       {/* Main Container Content */}
       {!currentUser ? (
         // SIMPLIFIED SIGN UP / LOGIN PAGE
-        <main className="flex-1 flex flex-col items-center justify-start md:justify-center p-4 sm:p-6 bg-slate-50 overflow-y-auto">
+        <main className="flex-1 flex flex-col items-center justify-center p-4 sm:p-6 bg-slate-50 overflow-y-auto">
           <div className="w-full max-w-md md:max-w-4xl grid grid-cols-1 md:grid-cols-12 gap-8 items-center mx-auto">
             
             {/* Left Side: Pitch and Seed Users (Desktop/Tablet only) */}
