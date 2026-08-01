@@ -955,6 +955,215 @@ Determine whether to APPROVE (on-topic or polite greeting) or REJECT (substantiv
   }
 });
 
+// 14. AI Message & File Content Search API
+app.post("/api/search-messages", async (req, res) => {
+  const { query, messages: candidateMessages = [], fileTypeFilter = "all" } = req.body;
+
+  if (!query || typeof query !== "string" || !query.trim()) {
+    return res.status(400).json({ error: "Search query string is required." });
+  }
+
+  const queryClean = query.trim().toLowerCase();
+  const startTime = Date.now();
+
+  // Combine server dbMessages with any client candidate messages to ensure full coverage
+  const allCandidatesMap = new Map<string, Message>();
+  dbMessages.forEach(m => allCandidatesMap.set(m.id, m));
+  if (Array.isArray(candidateMessages)) {
+    candidateMessages.forEach((m: Message) => {
+      if (m && m.id) allCandidatesMap.set(m.id, m);
+    });
+  }
+
+  let candidates = Array.from(allCandidatesMap.values());
+
+  // Apply file filter if requested
+  if (fileTypeFilter === "files") {
+    candidates = candidates.filter(m => !!(m.fileName || m.fileUrl || m.fileType || m.fileDescription));
+  } else if (fileTypeFilter === "text") {
+    candidates = candidates.filter(m => !m.fileName && !!m.text);
+  }
+
+  if (candidates.length === 0) {
+    return res.json({
+      success: true,
+      results: [],
+      aiExplanation: "No messages found matching the filter criteria.",
+      latencyMs: Date.now() - startTime,
+    });
+  }
+
+  // Attempt Gemini AI Semantic Ranking & Search
+  if (ai && !isGeminiQuotaActive()) {
+    try {
+      const candidateListForPrompt = candidates.map((m) => ({
+        id: m.id,
+        senderName: m.senderName,
+        text: m.text || "",
+        fileName: m.fileName || "",
+        fileType: m.fileType || "",
+        fileDescription: m.fileDescription || "",
+        timestamp: m.timestamp,
+      }));
+
+      const systemInstruction = `You are an AI Search Engine for a chat platform.
+Your job is to search through chat messages and file attachments to find those that match the user's query.
+Pay special attention to filenames, file descriptions, file types, and message text content.
+If the user is searching for a file, match it based on its filename, type, or contextual content description.
+Return a JSON object containing an array of matched messages ordered by relevance score (1-100), along with a short reason explaining WHY each message/file matched, and an overall concise AI summary.`;
+
+      const promptText = `User Search Query: "${query.trim()}"
+
+Candidate Messages & File Attachments to Search:
+${JSON.stringify(candidateListForPrompt.slice(0, 50), null, 2)}
+
+Identify the top matching messages/files for the query. Include relevance score (1-100) and specific match reason for each result.`;
+
+      const response = await generateContentWithRetry(ai, {
+        model: "gemini-3.5-flash",
+        contents: [promptText],
+        config: {
+          systemInstruction: systemInstruction,
+          responseMimeType: "application/json",
+          temperature: 0.1,
+          maxOutputTokens: 600,
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              matches: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    messageId: { type: Type.STRING },
+                    score: { type: Type.NUMBER },
+                    matchReason: { type: Type.STRING },
+                    isFileMatch: { type: Type.BOOLEAN },
+                  },
+                  required: ["messageId", "score", "matchReason"],
+                },
+              },
+              aiExplanation: { type: Type.STRING },
+            },
+            required: ["matches", "aiExplanation"],
+          },
+        },
+      });
+
+      const responseText = response.text || "{}";
+      const resultData = JSON.parse(responseText.trim());
+      const matches = resultData.matches || [];
+
+      // Map back to original Message objects
+      const structuredResults = matches
+        .map((match: any) => {
+          const originalMsg = candidates.find((m) => m.id === match.messageId);
+          if (!originalMsg) return null;
+          return {
+            message: originalMsg,
+            score: match.score || 80,
+            matchReason: match.matchReason || "Matched search keywords",
+            isFileMatch: match.isFileMatch ?? !!originalMsg.fileName,
+          };
+        })
+        .filter(Boolean);
+
+      return res.json({
+        success: true,
+        results: structuredResults,
+        aiExplanation: resultData.aiExplanation || `Found ${structuredResults.length} matching message(s) via Gemini AI.`,
+        latencyMs: Date.now() - startTime,
+        geminiActive: true,
+      });
+    } catch (err: any) {
+      console.error("Gemini AI Search error, using smart local search fallback:", err);
+    }
+  }
+
+  // Smart local keyword & semantic heuristic matcher fallback
+  const queryWords = queryClean.split(/\s+/).filter(w => w.length > 1);
+
+  const scoredResults = candidates.map((m) => {
+    let score = 0;
+    const matchReasons: string[] = [];
+
+    const fileNameLower = (m.fileName || "").toLowerCase();
+    const fileDescLower = (m.fileDescription || "").toLowerCase();
+    const fileTypeLower = (m.fileType || "").toLowerCase();
+    const textLower = (m.text || "").toLowerCase();
+    const senderLower = (m.senderName || "").toLowerCase();
+
+    // Exact filename match
+    if (fileNameLower && fileNameLower.includes(queryClean)) {
+      score += 60;
+      matchReasons.push(`Exact match in filename "${m.fileName}"`);
+    }
+
+    // Exact file description match
+    if (fileDescLower && fileDescLower.includes(queryClean)) {
+      score += 45;
+      matchReasons.push(`Matched in file description context`);
+    }
+
+    // Exact message text match
+    if (textLower && textLower.includes(queryClean)) {
+      score += 35;
+      matchReasons.push(`Matched message text`);
+    }
+
+    // Word-level search across fields
+    queryWords.forEach((word) => {
+      if (fileNameLower.includes(word)) {
+        score += 20;
+        if (!matchReasons.some(r => r.includes("filename"))) {
+          matchReasons.push(`Filename contains '${word}'`);
+        }
+      }
+      if (fileDescLower.includes(word)) {
+        score += 15;
+        if (!matchReasons.some(r => r.includes("description"))) {
+          matchReasons.push(`File context contains '${word}'`);
+        }
+      }
+      if (textLower.includes(word)) {
+        score += 10;
+        if (!matchReasons.some(r => r.includes("text"))) {
+          matchReasons.push(`Text contains '${word}'`);
+        }
+      }
+      if (fileTypeLower.includes(word)) {
+        score += 15;
+        matchReasons.push(`Matched file type ${m.fileType}`);
+      }
+      if (senderLower.includes(word)) {
+        score += 10;
+        matchReasons.push(`Sent by ${m.senderName}`);
+      }
+    });
+
+    return {
+      message: m,
+      score: Math.min(score, 100),
+      matchReason: matchReasons.length > 0 ? matchReasons.join(" • ") : "Contains matching search terms",
+      isFileMatch: !!m.fileName,
+    };
+  })
+  .filter(r => r.score > 0)
+  .sort((a, b) => b.score - a.score);
+
+  const isFileQuery = queryClean.includes("file") || queryClean.includes("pdf") || queryClean.includes("doc") || queryClean.includes("notes") || queryClean.includes("image") || queryClean.includes("video") || queryClean.includes("attachment");
+  
+  return res.json({
+    success: true,
+    results: scoredResults,
+    aiExplanation: scoredResults.length > 0
+      ? `Found ${scoredResults.length} result(s) matching "${query.trim()}". ${isFileQuery ? "Prioritized matching file names, attachments, and file contexts." : ""}`
+      : `No messages or files found matching "${query.trim()}".`,
+    latencyMs: Date.now() - startTime,
+    geminiActive: false,
+  });
+});
+
 
 // Serve React build in production, otherwise Vite handles development
 async function startServer() {

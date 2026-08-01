@@ -149,6 +149,21 @@ export default function App() {
   const [showAddContactModal, setShowAddContactModal] = useState(false);
   const [contactSearchQuery, setContactSearchQuery] = useState("");
 
+  // AI Message & File Content Search Modal States
+  const [showAiSearchModal, setShowAiSearchModal] = useState(false);
+  const [aiSearchQuery, setAiSearchQuery] = useState("");
+  const [aiSearchFileTypeFilter, setAiSearchFileTypeFilter] = useState<"all" | "files" | "text">("all");
+  const [aiSearchScope, setAiSearchScope] = useState<"current" | "all">("current");
+  const [aiSearchResults, setAiSearchResults] = useState<Array<{
+    message: Message;
+    score: number;
+    matchReason: string;
+    isFileMatch: boolean;
+  }> | null>(null);
+  const [aiSearchExplanation, setAiSearchExplanation] = useState("");
+  const [aiSearchLoading, setAiSearchLoading] = useState(false);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+
   // Alert/Feedback toast
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "info" } | null>(null);
 
@@ -603,6 +618,84 @@ export default function App() {
   useEffect(() => {
     setEvalResult(null);
   }, [messageText, attachedFile]);
+
+  // AI Message & File Search Execution Handler
+  const handlePerformAiSearch = async (overrideQuery?: string) => {
+    const queryToUse = overrideQuery !== undefined ? overrideQuery : aiSearchQuery;
+    if (!queryToUse.trim()) {
+      showToast("Please enter a keyword, filename, or topic to search.", "info");
+      return;
+    }
+
+    setAiSearchLoading(true);
+    try {
+      let candidatesToPass = messages;
+      if (aiSearchScope === "all") {
+        candidatesToPass = messages;
+      }
+
+      const res = await fetch("/api/search-messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: queryToUse.trim(),
+          messages: candidatesToPass,
+          fileTypeFilter: aiSearchFileTypeFilter,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setAiSearchResults(data.results || []);
+        setAiSearchExplanation(data.aiExplanation || "Search complete.");
+      } else {
+        showToast("Failed to perform AI search.", "error");
+      }
+    } catch (err) {
+      console.error("AI Search error:", err);
+      showToast("Error executing AI search.", "error");
+    } finally {
+      setAiSearchLoading(false);
+    }
+  };
+
+  const jumpToMessage = (msg: Message) => {
+    if (msg.groupId) {
+      const grp = groups.find(g => g.id === msg.groupId);
+      if (grp) {
+        setActiveGroup(grp);
+        setActiveRecipient(null);
+      }
+    } else if (msg.recipientId) {
+      if (msg.senderId === currentUser?.uid) {
+        const rec = users.find(u => u.uid === msg.recipientId);
+        if (rec) {
+          setActiveRecipient(rec);
+          setActiveGroup(null);
+        }
+      } else {
+        const snd = users.find(u => u.uid === msg.senderId);
+        if (snd) {
+          setActiveRecipient(snd);
+          setActiveGroup(null);
+        }
+      }
+    }
+
+    setShowAiSearchModal(false);
+    setHighlightedMessageId(msg.id);
+
+    setTimeout(() => {
+      const el = document.getElementById(`chat-msg-${msg.id}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }, 150);
+
+    setTimeout(() => {
+      setHighlightedMessageId(null);
+    }, 4000);
+  };
 
   const showToast = (message: string, type: "success" | "error" | "info" = "success") => {
     setToast({ message, type });
@@ -1616,6 +1709,22 @@ export default function App() {
           </div>
         </div>
 
+        {currentUser && (
+          <button
+            onClick={() => {
+              setAiSearchResults(null);
+              setAiSearchExplanation("");
+              setShowAiSearchModal(true);
+            }}
+            className="px-3 py-1.5 bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-600 hover:to-indigo-700 text-white font-extrabold text-xs rounded-xl shadow-sm flex items-center gap-1.5 transition-all cursor-pointer shrink-0"
+            title="Search messages and attached files using AI"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-200 animate-pulse" />
+            <span className="hidden sm:inline">✨ AI Search Messages & Files</span>
+            <span className="sm:hidden">✨ AI Search</span>
+          </button>
+        )}
+
 
       </header>
 
@@ -2504,8 +2613,11 @@ export default function App() {
                           
                           return (
                             <div
+                              id={`chat-msg-${m.id}`}
                               key={m.id}
-                              className={`flex items-end gap-2.5 ${isMyMessage ? "flex-row-reverse" : "text-left"}`}
+                              className={`flex items-end gap-2.5 transition-all duration-500 ${
+                                highlightedMessageId === m.id ? "ring-2 ring-sky-500 p-2.5 rounded-2xl bg-sky-50 shadow-md scale-[1.01]" : ""
+                              } ${isMyMessage ? "flex-row-reverse" : "text-left"}`}
                             >
                               <div className={`w-8 h-8 rounded-full text-[11px] font-bold flex items-center justify-center shrink-0 border ${
                                 isMyMessage
@@ -3337,6 +3449,277 @@ export default function App() {
                 className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl text-xs transition-colors cursor-pointer"
               >
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Message & File Search Modal */}
+      {showAiSearchModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4 animate-fade-in">
+          <div className="w-full max-w-2xl bg-white border border-slate-200 rounded-2xl shadow-2xl p-6 text-left space-y-4 max-h-[90vh] flex flex-col">
+            
+            {/* Modal Header */}
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3 shrink-0">
+              <div className="flex items-center gap-2">
+                <div className="p-2 rounded-xl bg-gradient-to-tr from-sky-500 to-indigo-600 text-white">
+                  <Sparkles className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-1.5">
+                    AI Message & File Search
+                  </h3>
+                  <p className="text-[10px] text-slate-500">
+                    Find messages and attached files by content, name, description, or topic via Gemini AI.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowAiSearchModal(false)}
+                className="text-slate-400 hover:text-slate-600 transition-colors text-lg font-bold cursor-pointer"
+              >
+                &times;
+              </button>
+            </div>
+
+            {/* Search Controls & Input Form */}
+            <div className="space-y-3 shrink-0">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handlePerformAiSearch();
+                }}
+                className="flex items-center gap-2"
+              >
+                <div className="relative flex-1">
+                  <input
+                    type="text"
+                    placeholder="Search file contents, filenames, or keywords (e.g. 'PDF notes', 'SN2 mechanisms', 'assignment 2')..."
+                    value={aiSearchQuery}
+                    onChange={(e) => setAiSearchQuery(e.target.value)}
+                    className="w-full pl-9 pr-8 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white font-medium"
+                  />
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  {aiSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAiSearchQuery("");
+                        setAiSearchResults(null);
+                      }}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 font-bold text-xs"
+                    >
+                      &times;
+                    </button>
+                  )}
+                </div>
+                <button
+                  type="submit"
+                  disabled={aiSearchLoading || !aiSearchQuery.trim()}
+                  className="px-4 py-2.5 bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-sm transition-all cursor-pointer shrink-0"
+                >
+                  {aiSearchLoading ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+                  <span>{aiSearchLoading ? "AI Searching..." : "Search"}</span>
+                </button>
+              </form>
+
+              {/* Example Search Query Pills */}
+              <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+                <span className="font-bold text-slate-400 uppercase tracking-wider text-[9px]">Try searching:</span>
+                {[
+                  "📄 PDF notes",
+                  "🧪 SN2 reaction mechanisms",
+                  "📝 Homework assignments",
+                  "🎥 YouTube video links",
+                  "📊 Lab report slides"
+                ].map((pill) => (
+                  <button
+                    key={pill}
+                    type="button"
+                    onClick={() => {
+                      const cleanPill = pill.replace(/^[^\w]+/, "").trim();
+                      setAiSearchQuery(cleanPill);
+                      handlePerformAiSearch(cleanPill);
+                    }}
+                    className="px-2 py-0.5 rounded-full bg-slate-100 hover:bg-sky-50 hover:text-sky-700 text-slate-600 border border-slate-200 text-[10px] transition-all cursor-pointer"
+                  >
+                    {pill}
+                  </button>
+                ))}
+              </div>
+
+              {/* Filter Tabs */}
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-100 text-[10px] font-bold text-slate-600">
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-400 uppercase tracking-wider text-[9px]">Type:</span>
+                  <button
+                    type="button"
+                    onClick={() => setAiSearchFileTypeFilter("all")}
+                    className={`px-2.5 py-1 rounded-lg border transition-all ${
+                      aiSearchFileTypeFilter === "all" ? "bg-sky-50 border-sky-300 text-sky-700" : "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    All Messages
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAiSearchFileTypeFilter("files")}
+                    className={`px-2.5 py-1 rounded-lg border transition-all flex items-center gap-1 ${
+                      aiSearchFileTypeFilter === "files" ? "bg-sky-50 border-sky-300 text-sky-700" : "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    <Paperclip className="w-3 h-3" /> Attached Files Only
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAiSearchFileTypeFilter("text")}
+                    className={`px-2.5 py-1 rounded-lg border transition-all ${
+                      aiSearchFileTypeFilter === "text" ? "bg-sky-50 border-sky-300 text-sky-700" : "bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    Text Only
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <span className="text-slate-400 uppercase tracking-wider text-[9px]">Scope:</span>
+                  <select
+                    value={aiSearchScope}
+                    onChange={(e) => setAiSearchScope(e.target.value as any)}
+                    className="px-2 py-0.5 bg-slate-50 border border-slate-200 rounded-lg text-[10px] font-bold text-slate-700 focus:outline-none"
+                  >
+                    <option value="current">Current Chat Room/DM</option>
+                    <option value="all">All Joined Rooms & DMs</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            {/* Results Area */}
+            <div className="flex-1 overflow-y-auto space-y-3 pr-1 min-h-[220px]">
+              {aiSearchLoading ? (
+                <div className="flex flex-col items-center justify-center py-12 text-center text-slate-500 space-y-2">
+                  <Sparkles className="w-8 h-8 text-sky-500 animate-spin" />
+                  <p className="text-xs font-bold text-slate-800">Gemini AI analyzing content and file attachments...</p>
+                  <p className="text-[10px] text-slate-400">Scanning filenames, file descriptions, and message text for matching references.</p>
+                </div>
+              ) : aiSearchResults === null ? (
+                <div className="flex flex-col items-center justify-center py-12 text-center text-slate-400 space-y-2">
+                  <Search className="w-8 h-8 text-slate-300" />
+                  <p className="text-xs font-semibold text-slate-600">Enter a query above to start AI Search</p>
+                  <p className="text-[10px] text-slate-400 max-w-sm">
+                    AI will search through both direct text and attached files (PDF, Word, PPT, Videos, YouTube links) by name and contextual content.
+                  </p>
+                </div>
+              ) : aiSearchResults.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-10 text-center text-slate-500 space-y-2 bg-slate-50 rounded-2xl border border-slate-200/60 p-6">
+                  <AlertTriangle className="w-8 h-8 text-amber-500" />
+                  <p className="text-xs font-bold text-slate-800">No matching messages or files found</p>
+                  <p className="text-[10px] text-slate-500 max-w-md">{aiSearchExplanation}</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {/* AI Overview Explanation */}
+                  {aiSearchExplanation && (
+                    <div className="p-3 bg-sky-50 border border-sky-100 rounded-xl text-xs text-sky-800 flex items-start gap-2">
+                      <Sparkles className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-bold block text-[10px] uppercase tracking-wider text-sky-700">AI Summary</span>
+                        <p className="text-[11px] leading-relaxed mt-0.5">{aiSearchExplanation}</p>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-1">
+                    Matching Results ({aiSearchResults.length})
+                  </div>
+
+                  <div className="space-y-2.5">
+                    {aiSearchResults.map((resItem) => {
+                      const m = resItem.message;
+                      const initial = m.senderName.split(" ").map((n) => n[0]).join("");
+
+                      return (
+                        <div
+                          key={m.id}
+                          className="p-3.5 bg-white border border-slate-200 hover:border-sky-300 rounded-2xl space-y-2 transition-all shadow-sm text-left hover:shadow-md"
+                        >
+                          <div className="flex items-center justify-between text-[10px]">
+                            <div className="flex items-center gap-2">
+                              <div className="w-6 h-6 rounded-full bg-slate-100 border border-slate-200 text-slate-700 font-bold text-[9px] flex items-center justify-center">
+                                {initial}
+                              </div>
+                              <span className="font-bold text-slate-800">{m.senderName}</span>
+                              <span className="text-slate-400 text-[9px]">
+                                {new Date(m.timestamp).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}
+                              </span>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                              {resItem.score && (
+                                <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 font-extrabold text-[9px] rounded-full border border-emerald-200">
+                                  {resItem.score}% match
+                                </span>
+                              )}
+                              <button
+                                onClick={() => jumpToMessage(m)}
+                                className="px-2.5 py-1 bg-sky-600 hover:bg-sky-500 text-white font-bold text-[10px] rounded-lg transition-all cursor-pointer flex items-center gap-1 shadow-sm"
+                              >
+                                Jump to Message →
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* AI Match Reason Badge */}
+                          <div className="text-[10px] bg-slate-50 border border-slate-200/80 p-2 rounded-xl text-slate-700 flex items-start gap-1.5">
+                            <span className="font-bold text-sky-600 shrink-0">✨ AI Match:</span>
+                            <span className="font-medium text-slate-600">{resItem.matchReason}</span>
+                          </div>
+
+                          {/* Render File Attachment Card if present */}
+                          {m.fileName && (
+                            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between gap-3 text-xs">
+                              <div className="flex items-center gap-2 min-w-0">
+                                {m.fileType === "Word" && <FileText className="w-5 h-5 text-blue-500 shrink-0" />}
+                                {m.fileType === "PPT" && <FileSpreadsheet className="w-5 h-5 text-orange-500 shrink-0" />}
+                                {m.fileType === "PDF" && <File className="w-5 h-5 text-red-500 shrink-0" />}
+                                {m.fileType === "Video" && <Video className="w-5 h-5 text-indigo-500 shrink-0" />}
+                                {m.fileType === "YouTube" && <Youtube className="w-5 h-5 text-red-500 shrink-0" />}
+                                {m.fileType === "Image" && <Image className="w-5 h-5 text-emerald-500 shrink-0" />}
+                                {(!m.fileType || m.fileType === "Other") && <Paperclip className="w-5 h-5 text-slate-500 shrink-0" />}
+
+                                <div className="min-w-0">
+                                  <div className="font-bold text-xs text-slate-800 truncate">{m.fileName}</div>
+                                  <div className="text-[9px] text-slate-500 truncate">{m.fileDescription || m.fileType || "File attachment"}</div>
+                                </div>
+                              </div>
+                              <span className="text-[9px] font-bold px-2 py-0.5 bg-white border border-slate-200 text-slate-600 rounded-md shrink-0">
+                                {m.fileType || "File"}
+                              </span>
+                            </div>
+                          )}
+
+                          {m.text && (
+                            <p className="text-xs text-slate-700 leading-relaxed bg-slate-50/50 p-2 rounded-xl border border-slate-100">
+                              "{m.text}"
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="flex justify-end pt-3 border-t border-slate-100 shrink-0">
+              <button
+                onClick={() => setShowAiSearchModal(false)}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl text-xs transition-colors cursor-pointer"
+              >
+                Close Search
               </button>
             </div>
           </div>
