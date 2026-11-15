@@ -1,0 +1,80 @@
+# Builds Gatekeeper Chat as an Android APK and a Windows .exe, and publishes both as a GitHub Release
+# (from main, or when run by hand). The download links stay the same for every release:
+#   https://github.com/<owner>/<repo>/releases/download/gatekeeperchat-latest/GatekeeperChat.apk
+#   https://github.com/<owner>/<repo>/releases/download/gatekeeperchat-latest/GatekeeperChat.exe
+name: Gatekeeper Chat apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: 'Address of the hosted app, e.g. https://my-app.example.com'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - name: Build APK
+        working-directory: android
+        run: gradle --no-daemon assembleRelease -PversionCode=${{ github.run_number }} -PremoteUrl="${{ inputs.app_url }}"
+      - name: Name the APK
+        run: |
+          mkdir out
+          cp android/app/build/outputs/apk/release/app-release.apk out/GatekeeperChat.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GatekeeperChat-apk
+          path: out/GatekeeperChat.apk
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Point the app at the hosted address
+        shell: bash
+        run: |
+          node -e "const f='desktop/app-config.json',c=require('./'+f);c.remoteUrl=process.argv[1];require('fs').writeFileSync(f,JSON.stringify(c,null,2))" "${{ inputs.app_url }}"
+      - name: Build the .exe
+        working-directory: desktop
+        run: |
+          npm install --no-audit --no-fund
+          npm run dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GatekeeperChat-exe
+          path: desktop/dist/GatekeeperChat.exe
+
+  release:
+    needs: [android, windows]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - name: Publish the release (replaces the previous one, so the links never change)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "gatekeeperchat-latest" --repo "${{ github.repository }}" --cleanup-tag --yes || true
+          sleep 5
+          gh release create "gatekeeperchat-latest" files/* \
+            --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "Gatekeeper Chat (build ${{ github.run_number }})" \
+            --notes "Android: download the .apk, open it on the phone and allow installing from this source. Windows: download the .exe and run it (no installation). Windows may warn that the app is from an unknown publisher: choose More info, then Run anyway."

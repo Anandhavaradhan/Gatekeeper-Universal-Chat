@@ -1,0 +1,8 @@
+{
+  "name": "Gatekeeper Chat",
+  "start": "index.html",
+  "remoteUrl": "",
+  "width": 1280,
+  "height": 820,
+  "background": "#f8fafc"
+}

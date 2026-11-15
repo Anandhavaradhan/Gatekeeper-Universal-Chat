@@ -80,6 +80,26 @@ Verification emails are not sent by the emulator; the links appear in its log.
 
 ---
 
+## ☁️ Hosting, and the Android and Windows apps
+
+Gatekeeper needs its server (it holds the Gemini key and checks every message), so it cannot run on GitHub Pages.
+Host the container, then build the apps to point at it:
+
+1. **Host it.** The `Dockerfile` runs anywhere containers do. On Google Cloud Run:
+   ```bash
+   gcloud run deploy gatekeeper --source . --region <region> --allow-unauthenticated \
+     --set-env-vars GEMINI_API_KEY=<your key>
+   ```
+   Then add the service's address in the Firebase console under Authentication → Settings → Authorized domains.
+2. **Build the apps.** In GitHub: Actions → **Gatekeeper Chat apps** → Run workflow, and enter the hosted address.
+   The APK and the Windows .exe are published as the `gatekeeperchat-latest` release:
+   - `https://github.com/Anandhavaradhan/Gatekeeper-Universal-Chat/releases/download/gatekeeperchat-latest/GatekeeperChat.apk`
+   - `https://github.com/Anandhavaradhan/Gatekeeper-Universal-Chat/releases/download/gatekeeperchat-latest/GatekeeperChat.exe`
+
+The apps (`android/`, `desktop/`) are thin shells that open the hosted site.
+
+---
+
 ## 📄 License
 
 MIT License. Built for Gatekeeper Universal Chat.
