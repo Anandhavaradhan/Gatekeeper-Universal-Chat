@@ -10,8 +10,9 @@ A feature-rich, topic-enforced universal chat platform built with React, TypeScr
 - **🛡️ Topic-Enforced Platform**: Intelligent AI topic checking and content validation ensuring discussions remain relevant and constructive.
 - **💬 Direct Messages & Group Channels**: Real-time group messaging and 1-on-1 direct conversations with presence and activity indicators.
 - **📁 File & Media Sharing**: Upload, attach, preview, and search across various document formats, images, videos, and links.
-- **📱 Mobile-Ready (Capacitor & Android)**: Configured with Capacitor for cross-platform Android native app builds and synchronization.
-- **🔥 Firebase Firestore Persistence**: Persistent multi-user chat storage and authentication.
+- **🔐 Real accounts**: Firebase Authentication with email + password and email verification. Disposable email domains are refused.
+- **🧱 Server-enforced moderation**: the server checks every request's Firebase ID token, moderates the message, and is the only thing that writes messages, groups and warnings. Firestore rules only let people read the groups and DMs they are part of.
+- **🔥 Firebase Firestore & Storage**: messages in Firestore, attachments in Cloud Storage, downloaded through the server after an access check.
 
 ---
 
@@ -19,8 +20,7 @@ A feature-rich, topic-enforced universal chat platform built with React, TypeScr
 
 - **Frontend**: React 18, TypeScript, Tailwind CSS, Lucide Icons, Motion / Framer Motion
 - **Backend / API**: Node.js, Express, Google Gen AI SDK (`@google/genai`), Esbuild
-- **Database & Auth**: Firebase Firestore & Firebase Auth
-- **Cross-Platform**: Capacitor (`@capacitor/core`, `@capacitor/android`)
+- **Database, Auth & Files**: Firebase Firestore, Firebase Auth, Cloud Storage (`firebase` on the client, `firebase-admin` on the server)
 - **Build Tooling**: Vite, `tsx`
 
 ---
@@ -58,20 +58,25 @@ npm install
 
 ---
 
-## 📱 Building for Mobile (Capacitor Android)
+## 🔥 Firebase setup
 
-To build and sync with Capacitor for Android:
+1. In the Firebase console for the project in `firebase-applet-config.json`, turn on **Authentication → Sign-in method → Email/Password**.
+2. Deploy the rules and indexes (the Firestore database id is set in `firebase.json`):
+   ```bash
+   npx firebase-tools deploy --only firestore,storage --project <projectId>
+   ```
+3. Give the server credentials for Firebase Admin. On Cloud Run / AI Studio the service account is used automatically.
+   Locally, set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key file for the project.
+
+### Run against the Firebase emulators (no cloud project needed)
 
 ```bash
-# 1. Build web production assets
-npm run build
-
-# 2. Sync web assets with native Android project
-npx cap sync
-
-# 3. Open in Android Studio (or run gradle build)
-npx cap open android
+npx firebase-tools emulators:start --only auth,firestore,storage --project gen-lang-client-0973407933
+# in another terminal
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 \
+FIREBASE_STORAGE_EMULATOR_HOST=127.0.0.1:9199 VITE_USE_FIREBASE_EMULATORS=true npm run dev
 ```
+Verification emails are not sent by the emulator; the links appear in its log.
 
 ---
 

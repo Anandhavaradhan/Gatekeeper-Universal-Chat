@@ -1,21 +1,62 @@
 rules_version = '2';
+
+// Gatekeeper Universal Chat
+// The server (server.ts, Firebase Admin SDK) writes every user, group, message, warning and log after
+// checking who is asking and moderating the content. Clients only read what they are part of.
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Allow read/write access to all collections for our simulated academic chat sandbox
-    match /users/{userId} {
-      allow read, write: if true;
+    function signedIn() {
+      return request.auth != null;
     }
+    function verified() {
+      return signedIn() && request.auth.token.email_verified == true;
+    }
+    function groupMembers(groupId) {
+      return get(/databases/$(database)/documents/groups/$(groupId)).data.members;
+    }
+
+    // Public profiles (name, username, email, groups) for finding people. Your own one even before verifying.
+    match /users/{uid} {
+      allow read: if verified() || (signedIn() && request.auth.uid == uid);
+      allow write: if false;
+    }
+
+    // Username reservations (server only)
+    match /usernames/{username} {
+      allow read, write: if false;
+    }
+
     match /groups/{groupId} {
-      allow read, write: if true;
+      allow read: if verified() && request.auth.uid in resource.data.members;
+      allow write: if false;
     }
+
+    // Group messages: current members of the group. DMs: the two people (also readable from dmKey,
+    // "uidA__uidB", so a query on dmKey can be checked).
+    // Also anyone in `audience` (who could read it when it was sent), used for new-message alerts.
     match /messages/{messageId} {
-      allow read, write: if true;
+      allow read: if verified() && (
+        request.auth.uid in resource.data.audience
+        || request.auth.uid in resource.data.get('participants', [])
+        || request.auth.uid in resource.data.dmKey.split('__')
+        || request.auth.uid in groupMembers(resource.data.groupId)
+      );
+      allow write: if false;
     }
+
+    // Your own moderation warnings; you may dismiss (delete) them.
     match /notifications/{notificationId} {
-      allow read, write: if true;
+      allow read, delete: if verified() && resource.data.userId == request.auth.uid;
+      allow create, update: if false;
     }
+
     match /logs/{logId} {
-      allow read, write: if true;
+      allow read: if verified() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

@@ -49,7 +49,6 @@ import {
   Monitor
 } from "lucide-react";
 import { User, Group, Message, Notification as GatekeeperNotification, GatekeeperLog, AppConfig } from "./types";
-import CodeGuides from "./components/CodeGuides";
 import {
   collection,
   doc,
@@ -64,21 +63,48 @@ import {
   deleteDoc,
   limit
 } from "firebase/firestore";
-import { db } from "./firebase";
+import {
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  sendEmailVerification,
+  sendPasswordResetEmail,
+  signOut,
+  reload,
+  type User as FirebaseUser,
+} from "firebase/auth";
+import { db, auth, api } from "./firebase";
 
-// Toggle to enable/disable pre-seeded accounts and their OTP-bypass logic
-const ENABLE_SEEDED_ACCOUNTS = true;
+const TEMP_EMAIL_DOMAINS = [
+  "mailinator.com", "tempmail.com", "temp-mail.org", "10minutemail.com",
+  "yopmail.com", "trashmail.com", "disposable.com", "generator.com", "fake.com",
+  "guerrillamail.com", "sharklasers.com", "getairmail.com", "dispostable.com", "maildrop.cc",
+  "tempmail.net", "tempmail.co", "crazymailing.com", "throwawaymail.com", "mailnesia.com",
+  "disposablemail.com", "tempmailaddress.com", "safe-mail.net", "yopmail.fr", "yopmail.net",
+];
+
+function authErrorMessage(err: any): string {
+  const code = String(err?.code || "");
+  if (code.includes("invalid-credential") || code.includes("wrong-password") || code.includes("user-not-found")) return "Incorrect email or password.";
+  if (code.includes("email-already-in-use")) return "An account with this email already exists. Sign in instead.";
+  if (code.includes("weak-password")) return "Please choose a stronger password (at least 6 characters).";
+  if (code.includes("invalid-email")) return "Please enter a valid email address.";
+  if (code.includes("too-many-requests")) return "Too many attempts. Please wait a moment and try again.";
+  if (code.includes("network-request-failed")) return "Network error. Check your connection and try again.";
+  return err?.message || "Something went wrong. Please try again.";
+}
 
 export default function App() {
-  // Authentication state
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    try {
-      const saved = localStorage.getItem("gatekeeper_user");
-      return saved ? JSON.parse(saved) : null;
-    } catch {
-      return null;
-    }
-  });
+  // Authentication state: authUser is the Firebase Auth account, currentUser its profile in Firestore.
+  // currentUser is only set once the email is verified and the profile exists.
+  const [authUser, setAuthUser] = useState<FirebaseUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [profile, setProfile] = useState<User | null>(null);
+  const [profileLoaded, setProfileLoaded] = useState(false);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [profileName, setProfileName] = useState("");
+  const [profileUsername, setProfileUsername] = useState("");
   
   // Login / Signup Form States
   const [loginEmail, setLoginEmail] = useState("");
@@ -91,11 +117,6 @@ export default function App() {
   const [showRegPassword, setShowRegPassword] = useState(false);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   
-  // OTP Verification States
-  const [otpCode, setOtpCode] = useState("");
-  const [otpSent, setOtpSent] = useState(false);
-  const [simulatedOtp, setSimulatedOtp] = useState("");
-  const [otpLoading, setOtpLoading] = useState(false);
 
   // Group creation States
   const [showCreateGroupModal, setShowCreateGroupModal] = useState(false);
@@ -112,7 +133,6 @@ export default function App() {
   const [activeRecipient, setActiveRecipient] = useState<User | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [notifications, setNotifications] = useState<GatekeeperNotification[]>([]);
-  const [logs, setLogs] = useState<GatekeeperLog[]>([]);
   const [appConfig, setAppConfig] = useState<AppConfig>({
     geminiActive: false,
     apiModel: "gemini-3.5-flash",
@@ -127,14 +147,12 @@ export default function App() {
   
   // Real File Upload & Scanning States
   const [attachedFile, setAttachedFile] = useState<File | null>(null);
-  const [fileContent, setFileContent] = useState("");
   const [fileBase64, setFileBase64] = useState("");
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Tab states for Side panels
   const [leftTab, setLeftTab] = useState<"groups" | "dms" | "warnings">("groups");
-  const [rightTab, setRightTab] = useState<"logs" | "code">("logs");
 
   // Modal / Inline Add Member States
   const [showAddMemberPanel, setShowAddMemberPanel] = useState(false);
@@ -213,7 +231,7 @@ export default function App() {
       setNotifPermission(permission);
       if (permission === "granted") {
         showToast("System notifications successfully enabled!", "success");
-        const testNotif = new Notification("Academic Chat Sandbox", {
+        const testNotif = new Notification("Gatekeeper Chat", {
           body: "You will now receive desktop and system alerts for incoming messages.",
           icon: "/favicon.ico"
         });
@@ -236,6 +254,7 @@ export default function App() {
 
     const qGlobalMessages = query(
       collection(db, "messages"),
+      where("audience", "array-contains", currentUser.uid),
       where("timestamp", ">=", mountTimeStr)
     );
 
@@ -302,133 +321,73 @@ export default function App() {
 
   // Auto-scrolling refs
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const logsEndRef = useRef<HTMLDivElement>(null);
 
-  // Seed initial academic sandbox users & rooms if completely empty
-  const SEED_USERS: User[] = [
-    { uid: "user_alice", name: "Alice Jenkins", username: "alice", password: "study123", email: "alice@school.edu", emailVerified: true, groups: [] },
-    { uid: "user_bob", name: "Bob Miller", username: "bob", password: "study123", email: "bob@school.edu", emailVerified: true, groups: [] },
-    { uid: "user_clara", name: "Prof. Clara", username: "clara", password: "study123", email: "clara@school.edu", emailVerified: true, groups: [] },
-  ];
+  // Server status (Gemini on or fallback moderation)
+  useEffect(() => {
+    fetch("/api/config")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((config) => config && setAppConfig(config))
+      .catch((err) => console.error("Config fetch error:", err));
+  }, []);
 
-  const SEED_GROUPS: Group[] = [];
+  // Firebase Auth session (persisted by Firebase across reloads)
+  useEffect(() => {
+    return onAuthStateChanged(auth, (u) => {
+      setAuthUser(u);
+      setAuthReady(true);
+      if (!u) {
+        setProfile(null);
+        setProfileLoaded(false);
+      }
+    });
+  }, []);
 
-  const SEED_MESSAGES: Message[] = [];
+  // The signed-in user's own profile document (kept live: groups change when someone adds you)
+  useEffect(() => {
+    if (!authUser) return;
+    setProfileLoaded(false);
+    return onSnapshot(
+      doc(db, "users", authUser.uid),
+      (snap) => {
+        setProfile(snap.exists() ? (snap.data() as User) : null);
+        setProfileLoaded(true);
+      },
+      (err) => {
+        console.error("Profile listener error:", err);
+        setProfileLoaded(true);
+      }
+    );
+  }, [authUser?.uid]);
 
-  const seedDatabaseIfEmpty = async () => {
-    if (!ENABLE_SEEDED_ACCOUNTS) {
-      console.log("Seeding disabled (ENABLE_SEEDED_ACCOUNTS is false).");
+  useEffect(() => {
+    setCurrentUser(authUser?.emailVerified && profile ? profile : null);
+  }, [authUser, authUser?.emailVerified, profile]);
+
+  // Everyone's public profiles (for contacts) and the groups I belong to
+  useEffect(() => {
+    if (!currentUser) {
+      setUsers([]);
+      setGroups([]);
       return;
     }
-    try {
-      const usersSnap = await getDocs(collection(db, "users"));
-      
-      // Ensure each seeded user exists individually
-      for (const u of SEED_USERS) {
-        const userDocRef = doc(db, "users", u.uid);
-        const userDocSnap = await getDoc(userDocRef);
-        if (!userDocSnap.exists()) {
-          console.log(`Seeding user ${u.name}...`);
-          await setDoc(userDocRef, u);
-        }
-      }
-
-      if (usersSnap.empty) {
-        console.log("Firestore empty. Performing full database initialization...");
-        
-        // Delete any legacy preset groups if present in the database to keep it clean
-        const legacyPresetIds = ["group_ds", "group_chem", "group_hist"];
-        for (const id of legacyPresetIds) {
-          await deleteDoc(doc(db, "groups", id));
-        }
-
-        const initLog: GatekeeperLog = {
-          id: "log_init",
-          timestamp: new Date().toISOString(),
-          type: "INFO",
-          details: "Gatekeeper Universal Chat Sandbox initialized successfully. No pre-set groups loaded.",
-          data: { activeGroupsCount: 0, loadedUsersCount: 3 },
-        };
-        await setDoc(doc(db, "logs", initLog.id), initLog);
-        console.log("Seeding complete!");
-      }
-    } catch (error) {
-      console.error("Failed to seed database:", error);
-    }
-  };
-
-  // Set up all Firestore real-time subscriptions and load config
-  useEffect(() => {
-    const fetchConfig = async () => {
-      try {
-        const res = await fetch("/api/config");
-        if (res.ok) {
-          const config = await res.json();
-          setAppConfig(config);
-        }
-      } catch (err) {
-        console.error("Config fetch error:", err);
-      }
-    };
-    fetchConfig();
-
-    const setupSubscriptions = async () => {
-      await seedDatabaseIfEmpty();
-
-      // Listen to Users
-      const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
-        const usersList: User[] = [];
-        snapshot.forEach((doc) => {
-          usersList.push(doc.data() as User);
-        });
-        setUsers(usersList);
-
-        // Restore / sync current user object
-        const savedUserUid = localStorage.getItem("gatekeeper_user_uid");
-        if (savedUserUid) {
-          const matchedUser = usersList.find((u) => u.uid === savedUserUid);
-          if (matchedUser) {
-            setCurrentUser(matchedUser);
-            localStorage.setItem("gatekeeper_user", JSON.stringify(matchedUser));
-          }
-        }
-      });
-
-      // Listen to Groups
-      const unsubGroups = onSnapshot(collection(db, "groups"), (snapshot) => {
-        const groupsList: Group[] = [];
-        snapshot.forEach((doc) => {
-          groupsList.push(doc.data() as Group);
-        });
-        setGroups(groupsList);
-      });
-
-      // Listen to Logs
-      const qLogs = query(collection(db, "logs"), orderBy("timestamp", "desc"), limit(100));
-      const unsubLogs = onSnapshot(qLogs, (snapshot) => {
-        const logsList: GatekeeperLog[] = [];
-        snapshot.forEach((doc) => {
-          logsList.push(doc.data() as GatekeeperLog);
-        });
-        setLogs(logsList);
-      });
-
-      return { unsubUsers, unsubGroups, unsubLogs };
-    };
-
-    let unsubscribers: { unsubUsers: () => void; unsubGroups: () => void; unsubLogs: () => void } | null = null;
-    setupSubscriptions().then((unsubs) => {
-      unsubscribers = unsubs;
-    });
-
+    const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+      setUsers(snapshot.docs.map((d) => d.data() as User));
+    }, (err) => console.error("Users listener error:", err));
+    const unsubGroups = onSnapshot(
+      query(collection(db, "groups"), where("members", "array-contains", currentUser.uid)),
+      (snapshot) => {
+        const list = snapshot.docs.map((d) => d.data() as Group);
+        setGroups(list);
+        // keep the open group's details (members) current
+        setActiveGroup((g) => (g ? list.find((x) => x.id === g.id) || null : g));
+      },
+      (err) => console.error("Groups listener error:", err)
+    );
     return () => {
-      if (unsubscribers) {
-        unsubscribers.unsubUsers();
-        unsubscribers.unsubGroups();
-        unsubscribers.unsubLogs();
-      }
+      unsubUsers();
+      unsubGroups();
     };
-  }, []);
+  }, [currentUser?.uid]);
 
   // Reset group info panel on active group change
   useEffect(() => {
@@ -458,28 +417,15 @@ export default function App() {
       );
 
       unsubMessages = onSnapshot(qMessages, (snapshot) => {
-        const msgsList: Message[] = [];
-        snapshot.forEach((doc) => {
-          msgsList.push(doc.data() as Message);
-        });
-        setMessages(msgsList);
-      });
+        setMessages(snapshot.docs.map((d) => d.data() as Message));
+      }, (err) => console.error("Group messages listener error:", err));
     } else if (activeRecipient) {
-      // Direct 1-on-1 Messages
-      const qAllMessages = query(collection(db, "messages"), orderBy("timestamp", "asc"));
-      unsubMessages = onSnapshot(qAllMessages, (snapshot) => {
-        const msgsList: Message[] = [];
-        snapshot.forEach((doc) => {
-          const msg = doc.data() as Message;
-          if (!msg.groupId && (
-            (msg.senderId === currentUser.uid && msg.recipientId === activeRecipient.uid) ||
-            (msg.senderId === activeRecipient.uid && msg.recipientId === currentUser.uid)
-          )) {
-            msgsList.push(msg);
-          }
-        });
-        setMessages(msgsList);
-      });
+      // Direct 1-on-1 Messages: only this pair's conversation
+      const dmKey = [currentUser.uid, activeRecipient.uid].sort().join("__");
+      const qDm = query(collection(db, "messages"), where("dmKey", "==", dmKey), orderBy("timestamp", "asc"));
+      unsubMessages = onSnapshot(qDm, (snapshot) => {
+        setMessages(snapshot.docs.map((d) => d.data() as Message));
+      }, (err) => console.error("DM listener error:", err));
     } else {
       setMessages([]);
     }
@@ -522,18 +468,17 @@ export default function App() {
       return;
     }
 
-    const qSentDMs = query(
+    // Everyone I have a DM conversation with (sent or received)
+    const qMyDMs = query(
       collection(db, "messages"),
-      where("senderId", "==", currentUser.uid)
+      where("participants", "array-contains", currentUser.uid)
     );
 
-    const unsub = onSnapshot(qSentDMs, (snapshot) => {
+    const unsub = onSnapshot(qMyDMs, (snapshot) => {
       const ids = new Set<string>();
       snapshot.forEach((doc) => {
         const msg = doc.data() as Message;
-        if (!msg.groupId && msg.recipientId) {
-          ids.add(msg.recipientId);
-        }
+        (msg.participants || []).forEach((p) => p !== currentUser.uid && ids.add(p));
       });
       setChattedUserIds(Array.from(ids));
     }, (error) => {
@@ -548,10 +493,6 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, evaluating]);
 
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
-
   // Live, debounced evaluation of message text while typing
   useEffect(() => {
     let active = true;
@@ -564,39 +505,21 @@ export default function App() {
     const timer = setTimeout(async () => {
       try {
         const trimmed = messageText.trim();
-        // Custom instant evaluation override for user testing request
-        if (trimmed.toLowerCase().includes("let's study inorganic chem from alice's account to bob's account") || trimmed.toLowerCase() === "let's study inorganic chem from alice's account to bob's account") {
-          if (!active) return;
-          setLiveEvalField({
+        const data = await api("/api/evaluate", {
+          json: {
             text: trimmed,
-            status: "APPROVED",
-            explanation: "Approved: The query explicitly focuses on Inorganic Chemistry study, assignments, and educational accounts mapping, which is fully aligned with approved academic collaboration policies.",
-            latencyMs: 145,
-            academicTopics: ["Inorganic Chemistry", "Educational Identity Routing", "Active Moderation Bypass"],
-            safetyFlags: [],
-            geminiActive: true
-          });
-          return;
-        }
-
-        const res = await fetch("/api/evaluate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: trimmed }),
+            groupId: activeGroup?.id,
+            friendlyPoliteFilter: !activeGroup ? friendlyFilterActive : undefined,
+          },
         });
-        if (res.ok) {
-          const data = await res.json();
-          if (!active) return;
-          setLiveEvalField({
-            text: trimmed,
-            status: data.status,
-            explanation: data.explanation || (data.status === "APPROVED" ? "Approved as relevant academic curriculum discussion." : "Rejected as off-topic chatter."),
-            latencyMs: data.latencyMs || 85,
-            academicTopics: data.status === "APPROVED" ? (trimmed.toLowerCase().includes("chem") ? ["Chemistry", "Academic Collaboration"] : ["Academic Collaboration"]) : [],
-            safetyFlags: [],
-            geminiActive: data.geminiActive
-          });
-        }
+        if (!active) return;
+        setLiveEvalField({
+          text: trimmed,
+          status: data.status,
+          explanation: data.explanation || (data.status === "APPROVED" ? "Looks on-topic." : "Looks off-topic for this chat."),
+          latencyMs: data.latencyMs || 0,
+          geminiActive: data.geminiActive,
+        });
       } catch (err) {
         console.error("Live evaluation preview error:", err);
       }
@@ -606,7 +529,7 @@ export default function App() {
       active = false;
       clearTimeout(timer);
     };
-  }, [messageText]);
+  }, [messageText, activeGroup?.id, friendlyFilterActive]);
 
   // Automatically clear previous message delivery rejection alert and live preview when user switches conversations/rooms
   useEffect(() => {
@@ -629,28 +552,17 @@ export default function App() {
 
     setAiSearchLoading(true);
     try {
-      let candidatesToPass = messages;
-      if (aiSearchScope === "all") {
-        candidatesToPass = messages;
-      }
-
-      const res = await fetch("/api/search-messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const data = await api("/api/search-messages", {
+        json: {
           query: queryToUse.trim(),
-          messages: candidatesToPass,
           fileTypeFilter: aiSearchFileTypeFilter,
-        }),
+          scope: aiSearchScope,
+          groupId: aiSearchScope === "current" ? activeGroup?.id : undefined,
+          recipientId: aiSearchScope === "current" && !activeGroup ? activeRecipient?.uid : undefined,
+        },
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        setAiSearchResults(data.results || []);
-        setAiSearchExplanation(data.aiExplanation || "Search complete.");
-      } else {
-        showToast("Failed to perform AI search.", "error");
-      }
+      setAiSearchResults(data.results || []);
+      setAiSearchExplanation(data.aiExplanation || "Search complete.");
     } catch (err) {
       console.error("AI Search error:", err);
       showToast("Error executing AI search.", "error");
@@ -702,382 +614,138 @@ export default function App() {
     setTimeout(() => setToast(null), 4000);
   };
 
-  // Helper to validate temporary emails on client-side instantly
   const isTempEmailClient = (email: string): boolean => {
-    const tempDomains = [
-      "mailinator.com", "tempmail.com", "temp-mail.org", "10minutemail.com",
-      "yopmail.com", "trashmail.com", "disposable.com", "generator.com", "fake.com",
-      "guerrillamail.com", "sharklasers.com", "getairmail.com", "dispostable.com", "maildrop.cc",
-      "tempmail.net", "tempmail.co", "crazymailing.com", "throwawaymail.com", "mailnesia.com",
-      "disposablemail.com", "tempmailaddress.com", "safe-mail.net", "yopmail.fr", "yopmail.net"
-    ];
     const parts = email.trim().toLowerCase().split("@");
     if (parts.length < 2) return true;
-    return tempDomains.includes(parts[1]);
+    return TEMP_EMAIL_DOMAINS.includes(parts[1]);
   };
 
-  // Auth Step 1: Send OTP for Login
-  const handleSendLoginOTP = async (e: React.FormEvent) => {
+  // Sign in with email + password (Firebase Auth)
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!loginEmail.trim() || !loginPassword) {
-      showToast("Email and Password are required.", "info");
+      showToast("Email and password are required.", "info");
       return;
     }
-
-    if (isTempEmailClient(loginEmail)) {
-      showToast("Temporary/disposable email domains are strictly prohibited for security.", "error");
-      return;
-    }
-
-    const emailLower = loginEmail.trim().toLowerCase();
-    let matched = users.find((u) => u.email?.toLowerCase() === emailLower);
-
-    if (!matched && ENABLE_SEEDED_ACCOUNTS) {
-      const seeded = SEED_USERS.find((u) => u.email.toLowerCase() === emailLower);
-      if (seeded) {
-        try {
-          await setDoc(doc(db, "users", seeded.uid), seeded);
-          matched = seeded;
-          setUsers((prev) => [...prev, seeded]);
-        } catch (err) {
-          console.error("Failed to seed user on the fly:", err);
-        }
-      }
-    }
-
-    if (!matched) {
-      showToast(`No registered student found with email "${loginEmail}". Please register!`, "error");
-      return;
-    }
-
-    // Check Password
-    const expectedPassword = matched.password || "study123";
-    if (loginPassword !== expectedPassword) {
-      showToast("Incorrect password. Please try again.", "error");
-      return;
-    }
-
-    // Check if it is a seeded account. If so, bypass OTP completely!
-    const isSeededAccount = ENABLE_SEEDED_ACCOUNTS && ["user_alice", "user_bob", "user_clara"].includes(matched.uid);
-    if (isSeededAccount) {
-      setCurrentUser(matched);
-      localStorage.setItem("gatekeeper_user_uid", matched.uid);
-      localStorage.setItem("gatekeeper_user", JSON.stringify(matched));
-
-      const logId = `log_${Date.now()}`;
-      try {
-        await setDoc(doc(db, "logs", logId), {
-          id: logId,
-          timestamp: new Date().toISOString(),
-          type: "INFO",
-          details: `User logged in (Seeded account bypass): ${matched.name} (${matched.email})`,
-          data: { userId: matched.uid },
-        });
-      } catch (err) {
-        console.error("Failed to write bypass log:", err);
-      }
-
-      showToast(`Welcome back, ${matched.name}!`, "success");
-      setLoginEmail("");
+    setAuthBusy(true);
+    try {
+      const cred = await signInWithEmailAndPassword(auth, loginEmail.trim(), loginPassword);
       setLoginPassword("");
-      setOtpCode("");
-      setOtpSent(false);
-      setSimulatedOtp("");
-
-      // Set active chat based on their groups
-      if (matched.groups.length > 0) {
-        const firstGroup = groups.find(g => g.id === matched.groups[0]);
-        if (firstGroup) {
-          setActiveGroup(firstGroup);
-          setActiveRecipient(null);
-        }
-      } else {
-        setActiveGroup(null);
-        setActiveRecipient(null);
-      }
-      return;
-    }
-
-    setOtpLoading(true);
-    try {
-      const res = await fetch("/api/auth/send-otp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: emailLower })
-      });
-
-      const data = await res.json();
-      if (res.ok) {
-        setOtpSent(true);
-        setSimulatedOtp(data.otp || "772491");
-        showToast("Simulated verification code generated!", "success");
-      } else {
-        showToast(data.error || "Failed to send OTP.", "error");
-      }
+      if (cred.user.emailVerified) showToast("Welcome back!", "success");
     } catch (err) {
-      showToast("Verification request failed. Using fallback code.", "info");
-      setOtpSent(true);
-      setSimulatedOtp("583491");
+      showToast(authErrorMessage(err), "error");
     } finally {
-      setOtpLoading(false);
+      setAuthBusy(false);
     }
   };
 
-  // Auth Step 2: Verify OTP and Log In
-  const handleVerifyLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!otpCode.trim()) {
-      showToast("Please enter the verification code.", "info");
+  const handleForgotPassword = async () => {
+    if (!loginEmail.trim()) {
+      showToast("Enter your email address above first.", "info");
       return;
     }
-
-    const emailLower = loginEmail.trim().toLowerCase();
-    setOtpLoading(true);
-
     try {
-      const res = await fetch("/api/auth/verify-otp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: emailLower, otp: otpCode.trim() })
-      });
-
-      const data = await res.json();
-      if (res.ok) {
-        const matched = users.find((u) => u.email?.toLowerCase() === emailLower);
-        if (matched) {
-          setCurrentUser(matched);
-          localStorage.setItem("gatekeeper_user_uid", matched.uid);
-          localStorage.setItem("gatekeeper_user", JSON.stringify(matched));
-
-          const logId = `log_${Date.now()}`;
-          await setDoc(doc(db, "logs", logId), {
-            id: logId,
-            timestamp: new Date().toISOString(),
-            type: "INFO",
-            details: `User logged in (OTP verified): ${matched.name} (${matched.email})`,
-            data: { userId: matched.uid },
-          });
-
-          showToast(`Welcome back, ${matched.name}!`, "success");
-          setLoginEmail("");
-          setLoginPassword("");
-          setOtpCode("");
-          setOtpSent(false);
-          setSimulatedOtp("");
-
-          // Set active chat based on their groups
-          if (matched.groups.length > 0) {
-            const firstGroup = groups.find(g => g.id === matched.groups[0]);
-            if (firstGroup) {
-              setActiveGroup(firstGroup);
-              setActiveRecipient(null);
-            }
-          } else {
-            setActiveGroup(null);
-            setActiveRecipient(null);
-          }
-        }
-      } else {
-        showToast(data.error || "Incorrect verification code.", "error");
-      }
+      await sendPasswordResetEmail(auth, loginEmail.trim());
+      showToast(`If an account exists for ${loginEmail.trim()}, a password reset email is on its way.`, "success");
     } catch (err) {
-      // Local check fallback in case server is unavailable
-      if (otpCode.trim() === simulatedOtp) {
-        const matched = users.find((u) => u.email?.toLowerCase() === emailLower);
-        if (matched) {
-          setCurrentUser(matched);
-          localStorage.setItem("gatekeeper_user_uid", matched.uid);
-          localStorage.setItem("gatekeeper_user", JSON.stringify(matched));
-          showToast(`Logged in successfully!`, "success");
-        }
-      } else {
-        showToast("Invalid verification code.", "error");
-      }
-    } finally {
-      setOtpLoading(false);
+      showToast(authErrorMessage(err), "error");
     }
   };
 
-  // Auth Step 1 (Register): Send OTP for Registration
-  const handleSendRegisterOTP = async (e: React.FormEvent) => {
+  // Create an account: Firebase Auth user, then the profile (server checks the username is free), then a verification email
+  const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!regName.trim() || !regUsername.trim() || !regPassword || !regEmail.trim()) {
       showToast("Please fill in all registration fields.", "info");
       return;
     }
-
-    if (regPassword.length < 4) {
-      showToast("Password must be at least 4 characters.", "error");
+    if (regPassword.length < 6) {
+      showToast("Password must be at least 6 characters.", "error");
       return;
     }
-
     if (isTempEmailClient(regEmail)) {
-      showToast("Temporary/disposable email domains are strictly prohibited for security.", "error");
+      showToast("Temporary/disposable email domains are not allowed.", "error");
       return;
     }
-
-    const emailLower = regEmail.trim().toLowerCase();
     const usernameLower = regUsername.trim().toLowerCase();
-
-    const emailExists = users.some((u) => u.email?.toLowerCase() === emailLower);
-    if (emailExists) {
-      showToast("A student profile with this email already exists.", "error");
+    if (!/^[a-z0-9_.]{3,24}$/.test(usernameLower)) {
+      showToast("Usernames are 3–24 characters: letters, numbers, dots and underscores.", "error");
       return;
     }
-
-    const usernameExists = users.some((u) => u.username.toLowerCase() === usernameLower);
-    if (usernameExists) {
-      showToast(`A student with username @${regUsername} already exists.`, "error");
-      return;
-    }
-
-    setOtpLoading(true);
+    setAuthBusy(true);
     try {
-      const res = await fetch("/api/auth/send-otp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: emailLower })
-      });
-
-      const data = await res.json();
-      if (res.ok) {
-        setOtpSent(true);
-        setSimulatedOtp(data.otp || "884192");
-        showToast("Simulated verification code generated for signup!", "success");
-      } else {
-        showToast(data.error || "Failed to send OTP.", "error");
+      const cred = await createUserWithEmailAndPassword(auth, regEmail.trim(), regPassword);
+      try {
+        await api("/api/profile", { json: { name: regName.trim(), username: usernameLower } });
+      } catch (err: any) {
+        // The account exists; the "finish your profile" step lets them pick another username.
+        setProfileName(regName.trim());
+        showToast(err.message, "error");
       }
+      await sendEmailVerification(cred.user);
+      setRegPassword("");
+      showToast(`Account created. We sent a verification link to ${cred.user.email}.`, "success");
     } catch (err) {
-      showToast("Verification request failed. Using fallback code.", "info");
-      setOtpSent(true);
-      setSimulatedOtp("492015");
+      showToast(authErrorMessage(err), "error");
     } finally {
-      setOtpLoading(false);
+      setAuthBusy(false);
     }
   };
 
-  // Auth Step 2 (Register): Verify OTP and Create Account
-  const handleVerifyAndRegister = async (e: React.FormEvent) => {
+  // Signed in but no profile yet (e.g. the username was taken at sign-up)
+  const handleCompleteProfile = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!otpCode.trim()) {
-      showToast("Please enter the verification code.", "info");
-      return;
-    }
-
-    const emailLower = regEmail.trim().toLowerCase();
-    const usernameLower = regUsername.trim().toLowerCase();
-    setOtpLoading(true);
-
+    setAuthBusy(true);
     try {
-      const res = await fetch("/api/auth/verify-otp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: emailLower, otp: otpCode.trim() })
-      });
-
-      const data = await res.json();
-      if (res.ok) {
-        const newUid = `user_${Date.now()}`;
-        const newUser: User = {
-          uid: newUid,
-          name: regName.trim(),
-          username: usernameLower,
-          password: regPassword,
-          email: emailLower,
-          emailVerified: true,
-          groups: [],
-        };
-
-        await setDoc(doc(db, "users", newUid), newUser);
-        setCurrentUser(newUser);
-        localStorage.setItem("gatekeeper_user_uid", newUid);
-        localStorage.setItem("gatekeeper_user", JSON.stringify(newUser));
-
-        const logId = `log_${Date.now()}`;
-        await setDoc(doc(db, "logs", logId), {
-          id: logId,
-          timestamp: new Date().toISOString(),
-          type: "INFO",
-          details: `New student registered: ${newUser.name} (${newUser.email})`,
-          data: { userId: newUid },
-        });
-
-        showToast(`Welcome, ${newUser.name}! Create or join groups to start chatting.`, "success");
-        setRegName("");
-        setRegUsername("");
-        setRegPassword("");
-        setRegEmail("");
-        setOtpCode("");
-        setOtpSent(false);
-        setSimulatedOtp("");
-        setActiveGroup(null);
-        setActiveRecipient(null);
-      } else {
-        showToast(data.error || "Incorrect verification code.", "error");
-      }
-    } catch (err) {
-      if (otpCode.trim() === simulatedOtp) {
-        const newUid = `user_${Date.now()}`;
-        const newUser: User = {
-          uid: newUid,
-          name: regName.trim(),
-          username: usernameLower,
-          password: regPassword,
-          email: emailLower,
-          emailVerified: true,
-          groups: [],
-        };
-        await setDoc(doc(db, "users", newUid), newUser);
-        setCurrentUser(newUser);
-        localStorage.setItem("gatekeeper_user_uid", newUid);
-        localStorage.setItem("gatekeeper_user", JSON.stringify(newUser));
-        showToast(`Registered successfully!`, "success");
-      } else {
-        showToast("Invalid verification code.", "error");
-      }
+      await api("/api/profile", { json: { name: profileName.trim(), username: profileUsername.trim().toLowerCase() } });
+      showToast("Profile saved.", "success");
+    } catch (err: any) {
+      showToast(err.message, "error");
     } finally {
-      setOtpLoading(false);
+      setAuthBusy(false);
     }
   };
 
-  // Auth: Quick login shortcuts (kept as utility if needed, but not rendered)
-  const handleQuickLogin = async (user: User) => {
-    setCurrentUser(user);
-    localStorage.setItem("gatekeeper_user_uid", user.uid);
-    localStorage.setItem("gatekeeper_user", JSON.stringify(user));
-    showToast(`Logged in as ${user.name}`, "success");
+  const handleResendVerification = async () => {
+    if (!auth.currentUser) return;
+    setAuthBusy(true);
+    try {
+      await sendEmailVerification(auth.currentUser);
+      showToast(`Verification email sent to ${auth.currentUser.email}.`, "success");
+    } catch (err) {
+      showToast(authErrorMessage(err), "error");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
 
-    const logId = `log_${Date.now()}`;
-    await setDoc(doc(db, "logs", logId), {
-      id: logId,
-      timestamp: new Date().toISOString(),
-      type: "INFO",
-      details: `Shortcut logged in: ${user.name} (@${user.username})`,
-      data: { userId: user.uid },
-    });
-
-    const matchedGrp = groups.find(g => user.groups.includes(g.id));
-    if (matchedGrp) {
-      setActiveGroup(matchedGrp);
-      setActiveRecipient(null);
-    } else if (groups.length > 0) {
-      setActiveGroup(groups[0]);
-      setActiveRecipient(null);
+  // After clicking the link in the email: refresh the account and its token
+  const handleCheckVerified = async () => {
+    if (!auth.currentUser) return;
+    setAuthBusy(true);
+    try {
+      await reload(auth.currentUser);
+      if (auth.currentUser.emailVerified) {
+        await auth.currentUser.getIdToken(true);
+        setAuthUser(Object.assign(Object.create(Object.getPrototypeOf(auth.currentUser)), auth.currentUser));
+        showToast("Email verified. Welcome!", "success");
+      } else {
+        showToast("Not verified yet. Click the link in the email, then try again.", "info");
+      }
+    } catch (err) {
+      showToast(authErrorMessage(err), "error");
+    } finally {
+      setAuthBusy(false);
     }
   };
 
   // Logout
-  const handleLogout = () => {
-    setCurrentUser(null);
-    localStorage.removeItem("gatekeeper_user_uid");
-    localStorage.removeItem("gatekeeper_user");
+  const handleLogout = async () => {
+    await signOut(auth);
     setActiveGroup(null);
     setActiveRecipient(null);
     setMessages([]);
-    setOtpSent(false);
-    setSimulatedOtp("");
-    setOtpCode("");
-    showToast("Logged out successfully.", "info");
+    showToast("Signed out.", "info");
   };
 
   // Group Management: Dynamic Custom Group Creation
@@ -1088,558 +756,191 @@ export default function App() {
       showToast("Group name and dynamic topic criteria are required.", "info");
       return;
     }
-
-    const groupId = `group_${Date.now()}`;
-    const newGroup: Group = {
-      id: groupId,
-      name: newGroupName.trim(),
-      description: newGroupDescription.trim(),
-      members: [currentUser.uid],
-      createdBy: currentUser.uid,
-    };
-
     try {
-      // 1. Create group doc in Firestore
-      await setDoc(doc(db, "groups", groupId), newGroup);
-
-      // 2. Add group to user's member groups
-      const updatedUserGroups = currentUser.groups ? [...currentUser.groups] : [];
-      if (!updatedUserGroups.includes(groupId)) {
-        updatedUserGroups.push(groupId);
-      }
-      await updateDoc(doc(db, "users", currentUser.uid), {
-        groups: updatedUserGroups,
+      const { group } = await api<{ group: Group }>("/api/groups", {
+        json: { name: newGroupName.trim(), description: newGroupDescription.trim() },
       });
-
-      // Update current user locally
-      const updatedUser = { ...currentUser, groups: updatedUserGroups };
-      setCurrentUser(updatedUser);
-      localStorage.setItem("gatekeeper_user", JSON.stringify(updatedUser));
-
-      // 3. Log group creation
-      const logId = `log_${Date.now()}`;
-      await setDoc(doc(db, "logs", logId), {
-        id: logId,
-        timestamp: new Date().toISOString(),
-        type: "INFO",
-        details: `Custom group "${newGroup.name}" created by ${currentUser.name}. Subject enforce description: "${newGroup.description}"`,
-        data: { groupId, createdBy: currentUser.uid },
-      });
-
-      // Reset form states
       setNewGroupName("");
       setNewGroupDescription("");
       setShowCreateGroupModal(false);
-      setActiveGroup(newGroup);
+      setActiveGroup(group);
       setActiveRecipient(null);
-      showToast(`Group "${newGroup.name}" created! Topic guardrails are active.`, "success");
-    } catch (err) {
-      console.error("Failed to create custom group:", err);
-      showToast("Error creating group. Try again.", "error");
+      showToast(`Group "${group.name}" created! Topic guardrails are active.`, "success");
+    } catch (err: any) {
+      showToast(err.message || "Error creating group. Try again.", "error");
     }
   };
 
-  // Invite/Add a student to the active group
+  // Invite/Add someone to the active group
   const handleAddMemberToGroup = async (userIdToAdd: string) => {
     if (!currentUser || !activeGroup) return;
-
+    const userToAdd = users.find((u) => u.uid === userIdToAdd);
     try {
-      const userToAdd = users.find((u) => u.uid === userIdToAdd);
-      if (!userToAdd) {
-        showToast("User profile not found.", "error");
-        return;
-      }
-
-      const updatedMembers = [...activeGroup.members];
-      if (!updatedMembers.includes(userIdToAdd)) {
-        updatedMembers.push(userIdToAdd);
-      }
-
-      await updateDoc(doc(db, "groups", activeGroup.id), {
-        members: updatedMembers,
-      });
-
-      const userGroups = [...userToAdd.groups];
-      if (!userGroups.includes(activeGroup.id)) {
-        userGroups.push(activeGroup.id);
-      }
-
-      await updateDoc(doc(db, "users", userIdToAdd), {
-        groups: userGroups,
-      });
-
-      const updatedGroup = { ...activeGroup, members: updatedMembers };
-      setActiveGroup(updatedGroup);
-
-      const logId = `log_${Date.now()}`;
-      await setDoc(doc(db, "logs", logId), {
-        id: logId,
-        timestamp: new Date().toISOString(),
-        type: "INFO",
-        details: `${currentUser.name} added ${userToAdd.name} to ${activeGroup.name}`,
-        data: { groupId: activeGroup.id, senderId: currentUser.uid, userIdToAdd },
-      });
-
-      showToast(`Successfully added ${userToAdd.name} to this study room!`, "success");
+      await api(`/api/groups/${activeGroup.id}/members`, { json: { userId: userIdToAdd } });
+      showToast(`Added ${userToAdd?.name || "them"} to this group!`, "success");
       setShowAddMemberPanel(false);
-    } catch (err) {
-      console.error("Error adding member:", err);
-      showToast("Failed to add member.", "error");
+    } catch (err: any) {
+      showToast(err.message || "Failed to add member.", "error");
     }
   };
 
-  // Leave active study room
+  // Leave the active group
   const handleLeaveGroup = async () => {
     if (!currentUser || !activeGroup) return;
-
+    const name = activeGroup.name;
     try {
-      const updatedMembers = activeGroup.members.filter((uid) => uid !== currentUser.uid);
-      await updateDoc(doc(db, "groups", activeGroup.id), {
-        members: updatedMembers,
-      });
-
-      const updatedUserGroups = currentUser.groups.filter((gid) => gid !== activeGroup.id);
-      await updateDoc(doc(db, "users", currentUser.uid), {
-        groups: updatedUserGroups,
-      });
-
-      // Log the event in audit logs
-      const logId = `log_${Date.now()}`;
-      await setDoc(doc(db, "logs", logId), {
-        id: logId,
-        timestamp: new Date().toISOString(),
-        type: "INFO",
-        details: `${currentUser.name} left the study room ${activeGroup.name}`,
-        data: { groupId: activeGroup.id, userId: currentUser.uid },
-      });
-
+      await api(`/api/groups/${activeGroup.id}/leave`, { json: {} });
       setShowLeaveConfirm(false);
       setActiveGroup(null);
-      showToast(`You have successfully left "${activeGroup.name}".`, "success");
-    } catch (err) {
-      console.error("Error leaving group:", err);
-      showToast("Failed to leave study room.", "error");
+      showToast(`You have left "${name}".`, "success");
+    } catch (err: any) {
+      showToast(err.message || "Failed to leave the group.", "error");
     }
   };
 
-  // Reset Database back to default seeded values
-  const handleResetDatabase = async () => {
-    if (!window.confirm("Are you sure you want to reset the Firebase Database back to default seed values? This deletes all custom rooms/messages.")) return;
-    try {
-      showToast("Resetting study database...", "info");
-
-      const usersSnap = await getDocs(collection(db, "users"));
-      for (const d of usersSnap.docs) {
-        await deleteDoc(doc(db, "users", d.id));
-      }
-
-      const groupsSnap = await getDocs(collection(db, "groups"));
-      for (const d of groupsSnap.docs) {
-        await deleteDoc(doc(db, "groups", d.id));
-      }
-
-      const messagesSnap = await getDocs(collection(db, "messages"));
-      for (const d of messagesSnap.docs) {
-        await deleteDoc(doc(db, "messages", d.id));
-      }
-
-      const notificationsSnap = await getDocs(collection(db, "notifications"));
-      for (const d of notificationsSnap.docs) {
-        await deleteDoc(doc(db, "notifications", d.id));
-      }
-
-      const logsSnap = await getDocs(collection(db, "logs"));
-      for (const d of logsSnap.docs) {
-        await deleteDoc(doc(db, "logs", d.id));
-      }
-
-      await seedDatabaseIfEmpty();
-
-      setCurrentUser(null);
-      localStorage.removeItem("gatekeeper_user_uid");
-      localStorage.removeItem("gatekeeper_user");
-      setActiveGroup(null);
-      setActiveRecipient(null);
-      setEvalResult(null);
-
-      showToast("Firebase database successfully reseeded!", "success");
-    } catch (err) {
-      console.error("Error resetting database:", err);
-      showToast("Failed to reset database.", "error");
-    }
-  };
-
-  // Send moderated chat message
+  // Send a message. The server moderates it and stores it only if approved.
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) return;
     if (!activeGroup && !activeRecipient) {
-      showToast("Please choose a study room or DM contact.", "info");
+      showToast("Please choose a group or DM contact.", "info");
       return;
     }
-
-    const cleanDoc = (obj: any): any => {
-      const clean: any = {};
-      Object.keys(obj).forEach((key) => {
-        if (obj[key] !== undefined) {
-          if (typeof obj[key] === "object" && obj[key] !== null && !Array.isArray(obj[key])) {
-            clean[key] = cleanDoc(obj[key]);
-          } else {
-            clean[key] = obj[key];
-          }
-        }
-      });
-      return clean;
-    };
-
     const hasText = messageText.trim().length > 0;
-    const hasFile = !!attachedFile;
-
-    if (!hasText && !hasFile) {
+    if (!hasText && !attachedFile) {
       showToast("Please write a message or attach a file.", "info");
       return;
     }
+    if (attachedFile && !fileBase64) {
+      showToast("Still reading the attached file. Try again in a moment.", "info");
+      return;
+    }
 
     setEvaluating(true);
     setEvalResult(null);
-
-    const textToSend = messageText;
-    const attachName = attachedFile ? attachedFile.name : undefined;
-    
-    const ext = attachedFile ? attachedFile.name.split('.').pop()?.toLowerCase() || "" : "";
-    let attachType: "PDF" | "Video" | "Image" | "Word" | "PPT" | "Other" = "Other";
-    if (["pdf"].includes(ext)) attachType = "PDF";
-    else if (["doc", "docx"].includes(ext)) attachType = "Word";
-    else if (["ppt", "pptx"].includes(ext)) attachType = "PPT";
-    else if (["mp4", "mov", "avi"].includes(ext)) attachType = "Video";
-    else if (["png", "jpg", "jpeg", "webp"].includes(ext)) attachType = "Image";
-
-    const contentToSend = fileContent;
-    const base64ToSend = fileBase64;
-
     try {
-      // 1. Run safe proxy Gemini evaluation
-      const res = await fetch("/api/evaluate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: textToSend || undefined,
-          fileName: attachName,
-          fileType: attachType,
-          fileContent: contentToSend || undefined,
-          fileBase64: base64ToSend || undefined,
-          fileDescription: attachName ? `${attachType} study resource` : undefined,
-          isDM: !activeGroup,
+      const data = await api("/api/messages", {
+        json: {
+          groupId: activeGroup?.id,
+          recipientId: activeGroup ? undefined : activeRecipient?.uid,
+          text: hasText ? messageText : undefined,
+          file: attachedFile ? { name: attachedFile.name, mimeType: attachedFile.type, base64: fileBase64 } : undefined,
           friendlyPoliteFilter: !activeGroup ? friendlyFilterActive : undefined,
-          groupName: activeGroup?.name || undefined,
-          groupDescription: activeGroup?.description || undefined,
-        }),
+          replyToId: replyingToMessage?.id,
+        },
       });
-
-      const data = await res.json();
-      setEvaluating(false);
-
-      const targetName = activeGroup 
-        ? `group "${activeGroup.name}"` 
-        : `direct user @${activeRecipient?.username} (${activeRecipient?.name})`;
-
       if (data.status === "APPROVED") {
         setEvalResult(null);
         setLiveEvalField(null);
-
-        // Clear inputs upon successful delivery
         setMessageText("");
         setAttachedFile(null);
-        setFileContent("");
         setFileBase64("");
         if (fileInputRef.current) fileInputRef.current.value = "";
-        
-        // 2. Write approved message to Firestore
-        const newMsgId = `msg_approved_${Date.now()}`;
-        const newMsg: Message = {
-          id: newMsgId,
-          groupId: activeGroup?.id || undefined,
-          recipientId: activeRecipient?.uid || undefined,
-          senderId: currentUser.uid,
-          senderName: currentUser.name,
-          text: textToSend || undefined,
-          fileName: attachName,
-          fileType: attachType,
-          fileDescription: attachName ? `${attachType} study resource` : undefined,
-          fileUrl: attachName ? `https://firebasestorage.googleapis.com/v0/b/gatekeeper-academic.appspot.com/o/uploads%2F${currentUser.uid}%2F${Date.now()}_${attachName}` : undefined,
-          timestamp: new Date().toISOString(),
-          approvedAt: new Date().toISOString(),
-          ...(replyingToMessage ? {
-            replyToId: replyingToMessage.id,
-            replyToSenderName: replyingToMessage.senderName,
-            replyToText: replyingToMessage.text || (replyingToMessage.fileName ? `[Attached ${replyingToMessage.fileType}]` : "Attachment"),
-          } : {})
-        };
-
-        await setDoc(doc(db, "messages", newMsgId), cleanDoc(newMsg));
         setReplyingToMessage(null);
-
-        // Log audit trail to Firestore
-        const logId = `log_${Date.now()}`;
-        await setDoc(doc(db, "logs", logId), cleanDoc({
-          id: logId,
-          timestamp: new Date().toISOString(),
-          type: "APPROVED",
-          details: `Gatekeeper approved message to ${targetName} (${data.latencyMs}ms)`,
-          data: {
-            messageId: newMsgId,
-            text: newMsg.text || null,
-            latencyMs: data.latencyMs,
-          },
-        }));
       } else {
-        // Rejected
         setLiveEvalField(null);
-        setEvalResult({
-          status: "REJECTED",
-          explanation: data.explanation || "This channel is reserved for academic coursework and educational resource sharing.",
-          latency: data.latencyMs,
-        });
+        setEvalResult({ status: "REJECTED", explanation: data.explanation, latency: data.latencyMs });
         showToast("Message could not be delivered.", "error");
-
-        // Write warning alert notification to user in Firestore
-        const warningId = `warn_${Date.now()}`;
-        const warning: GatekeeperNotification = {
-          id: warningId,
-          userId: currentUser.uid,
-          messageId: `msg_pending_${Date.now()}`,
-          messageText: textToSend || `[File: ${attachName || "Unnamed"}]`,
-          explanation: data.explanation || "Rejected as non-academic chatter.",
-          timestamp: new Date().toISOString(),
-        };
-
-        await setDoc(doc(db, "notifications", warningId), cleanDoc(warning));
-
-        // Log audit trail to Firestore
-        const logId = `log_${Date.now()}`;
-        await setDoc(doc(db, "logs", logId), cleanDoc({
-          id: logId,
-          timestamp: new Date().toISOString(),
-          type: "REJECTED",
-          details: `Gatekeeper rejected message by ${currentUser.name} (${data.latencyMs}ms). Private warning sent.`,
-          data: {
-            reason: data.explanation || null,
-            latencyMs: data.latencyMs,
-          },
-        }));
       }
     } catch (err: any) {
+      showToast(err.message || "Sending failed.", "error");
+    } finally {
       setEvaluating(false);
-      console.error("Evaluation processing error:", err);
-      showToast(`Evaluation processing failed: ${err.message || err}`, "error");
     }
   };
 
-  // Delete message (only allowed for original sender)
+  // Delete a message you sent
   const handleDeleteMessage = async (messageId: string) => {
     if (!currentUser) return;
     try {
-      await deleteDoc(doc(db, "messages", messageId));
-      showToast("Message deleted successfully.", "success");
-      
-      const logId = `log_${Date.now()}`;
-      await setDoc(doc(db, "logs", logId), {
-        id: logId,
-        timestamp: new Date().toISOString(),
-        type: "INFO",
-        details: `${currentUser.name} deleted a message they sent.`,
-        data: { messageId, userId: currentUser.uid },
-      });
-    } catch (err) {
-      console.error("Error deleting message:", err);
-      showToast("Failed to delete message.", "error");
+      await api(`/api/messages/${messageId}`, { method: "DELETE" });
+      showToast("Message deleted.", "success");
+    } catch (err: any) {
+      showToast(err.message || "Failed to delete message.", "error");
     }
   };
 
-  // Forward message to selected study group or recipient
+  // Forward a message to a group or person (moderated for the destination)
   const handleForwardMessage = async (destGroupId?: string, destRecipientId?: string) => {
     if (!currentUser || !forwardingMessage) return;
-    
-    const textToSend = forwardingMessage.text || "";
-    const attachName = forwardingMessage.fileName;
-    const attachType = forwardingMessage.fileType || "Other";
-    const fileUrl = forwardingMessage.fileUrl;
-    const fileDescription = forwardingMessage.fileDescription;
-
+    const original = forwardingMessage;
     setEvaluating(true);
     setEvalResult(null);
-    setForwardingMessage(null); // Close modal/overlay instantly
-
+    setForwardingMessage(null);
     try {
-      // 1. Run safe proxy Gemini evaluation for destination safety
-      const res = await fetch("/api/evaluate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: textToSend || undefined,
-          fileName: attachName,
-          fileType: attachType,
-          fileDescription: fileDescription || (attachName ? `${attachType} study resource` : undefined),
-        }),
+      const data = await api("/api/messages", {
+        json: { groupId: destGroupId, recipientId: destRecipientId, forwardOfId: original.id },
       });
-
-      const data = await res.json();
-      setEvaluating(false);
-
-      const targetGroup = destGroupId ? groups.find(g => g.id === destGroupId) : null;
-      const targetUser = destRecipientId ? users.find(u => u.uid === destRecipientId) : null;
-      const targetName = targetGroup 
-        ? `group "${targetGroup.name}"` 
-        : `direct user @${targetUser?.username} (${targetUser?.name})`;
-
       if (data.status === "APPROVED") {
-        setEvalResult(null);
-        
-        // 2. Write approved message to Firestore
-        const newMsgId = `msg_approved_${Date.now()}`;
-        const newMsg: Message = {
-          id: newMsgId,
-          groupId: destGroupId || undefined,
-          recipientId: destRecipientId || undefined,
-          senderId: currentUser.uid,
-          senderName: currentUser.name,
-          text: textToSend || undefined,
-          fileName: attachName,
-          fileType: attachType as any,
-          fileDescription: fileDescription,
-          fileUrl: fileUrl,
-          timestamp: new Date().toISOString(),
-          approvedAt: new Date().toISOString(),
-          // Add forward info
-          isForwarded: true,
-          originalSenderName: forwardingMessage.senderName,
-        };
-
-        await setDoc(doc(db, "messages", newMsgId), newMsg);
-
-        // Log audit trail to Firestore
-        const logId = `log_${Date.now()}`;
-        await setDoc(doc(db, "logs", logId), {
-          id: logId,
-          timestamp: new Date().toISOString(),
-          type: "APPROVED",
-          details: `Gatekeeper approved forwarded message from ${forwardingMessage.senderName} to ${targetName} (${data.latencyMs}ms)`,
-          data: {
-            messageId: newMsgId,
-            text: newMsg.text,
-            latencyMs: data.latencyMs,
-          },
-        });
-        showToast("Message forwarded successfully!", "success");
+        showToast("Message forwarded!", "success");
       } else {
-        // Rejected
-        setEvalResult({
-          status: "REJECTED",
-          explanation: data.explanation || "This channel is reserved for academic coursework and educational resource sharing.",
-          latency: data.latencyMs,
-        });
+        setEvalResult({ status: "REJECTED", explanation: data.explanation, latency: data.latencyMs });
         showToast("Forwarded message blocked by Gatekeeper.", "error");
-
-        // Write warning alert notification to user in Firestore
-        const warningId = `warn_${Date.now()}`;
-        const warning: GatekeeperNotification = {
-          id: warningId,
-          userId: currentUser.uid,
-          messageId: `msg_pending_${Date.now()}`,
-          messageText: textToSend || `[Forwarded File: ${attachName || "Unnamed"}]`,
-          explanation: `[Forward Rejected] ${data.explanation || "Rejected as non-academic chatter."}`,
-          timestamp: new Date().toISOString(),
-        };
-
-        await setDoc(doc(db, "notifications", warningId), warning);
-
-        // Log audit trail to Firestore
-        const logId = `log_${Date.now()}`;
-        await setDoc(doc(db, "logs", logId), {
-          id: logId,
-          timestamp: new Date().toISOString(),
-          type: "REJECTED",
-          details: `Gatekeeper blocked forwarded message by ${currentUser.name} to ${targetName} (${data.latencyMs}ms). Private warning sent.`,
-          data: {
-            reason: data.explanation,
-            latencyMs: data.latencyMs,
-          },
-        });
       }
-    } catch (err) {
+    } catch (err: any) {
+      showToast(err.message || "Error forwarding the message.", "error");
+    } finally {
       setEvaluating(false);
-      showToast("Error processing forwarding request.", "error");
     }
   };
 
-  // Process real attached file, read contents if text or image
-  const processAttachedFile = (file: File) => {
-    setAttachedFile(file);
-    setFileContent("");
-    setFileBase64("");
+  // Open an attachment: the server checks you can read the message, then sends the file
+  const openAttachment = async (m: Message) => {
+    const win = window.open("", "_blank");
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      const res = await fetch(`/api/messages/${m.id}/file`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Could not open the file.");
+      }
+      const url = URL.createObjectURL(await res.blob());
+      if (win) win.location.href = url;
+      else {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = m.fileName || "file";
+        a.click();
+      }
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (err: any) {
+      win?.close();
+      showToast(err.message || "Could not open the file.", "error");
+    }
+  };
 
+  // Dismiss a moderation warning
+  const dismissWarning = async (id: string) => {
+    try {
+      await deleteDoc(doc(db, "notifications", id));
+    } catch (err) {
+      console.error("Failed to dismiss warning", err);
+    }
+  };
+
+  // Read the attached file (sent to the server, which moderates and stores it)
+  const processAttachedFile = (file: File) => {
+    setFileBase64("");
     if (file.size > 5 * 1024 * 1024) {
       showToast("File size must be under 5MB.", "error");
       setAttachedFile(null);
       return;
     }
-
-    const ext = file.name.split('.').pop()?.toLowerCase() || "";
-    const isImage = file.type.startsWith("image/") || ["png", "jpg", "jpeg", "webp"].includes(ext);
-    const textExtensions = ["txt", "py", "js", "ts", "json", "md", "csv", "html", "css", "xml", "yaml", "yml", "sql", "sh"];
-    const isText = file.type.startsWith("text/") || textExtensions.includes(ext);
-
-    if (isImage) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const result = e.target?.result as string;
-        const base64Data = result.split(',')[1];
-        setFileBase64(base64Data);
-      };
-      reader.readAsDataURL(file);
-      showToast(`Attached image file: ${file.name}`, "info");
-    } else if (isText) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const text = e.target?.result as string;
-        setFileContent(text.slice(0, 15000));
-      };
-      reader.readAsText(file);
-      showToast(`Attached text file: ${file.name}`, "info");
-    } else {
-      showToast(`Attached file: ${file.name} (will scan metadata)`, "info");
-    }
+    setAttachedFile(file);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const result = String(e.target?.result || "");
+      setFileBase64(result.slice(result.indexOf(",") + 1));
+    };
+    reader.onerror = () => showToast("Could not read that file.", "error");
+    reader.readAsDataURL(file);
+    showToast(`Attached ${file.name}`, "info");
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       processAttachedFile(e.target.files[0]);
     }
-  };
-
-  // Mock file triggers for fast validation testing
-  const selectPresetFile = (presetType: "math" | "chem" | "offtopic") => {
-    let mockFile: File;
-    if (presetType === "math") {
-      mockFile = new File(
-        [`# Gradient Descent Optimizer Proof\nimport numpy as np\n\ndef gradient_descent(X, y, lr=0.01):\n    # Simple absolute boundary proof for sparsity\n    return np.linalg.pinv(X.T @ X) @ X.T @ y`],
-        "gradient_descent_proof.py",
-        { type: "text/x-python" }
-      );
-    } else if (presetType === "chem") {
-      mockFile = new File(
-        [`Organic Chemistry Lab Report draft:\nReviewing transition state energy barriers under SN1 and SN2 nucleophilic substitutions. SN2 requires polar aprotic solvents like acetone to preserve nucleophile strength.`],
-        "SN2_reaction_mechanisms.txt",
-        { type: "text/plain" }
-      );
-    } else {
-      mockFile = new File(
-        [`Guys, tonight is weekend campus beer party at Alice's dorm room. Free food and beer! Bring your gaming consoles and let's hang out! No school talk permitted.`],
-        "weekend_party_plans.txt",
-        { type: "text/plain" }
-      );
-    }
-    processAttachedFile(mockFile);
   };
 
   // Drag and drop attachment helper
@@ -1764,7 +1065,7 @@ export default function App() {
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="text-sky-600 font-bold">•</span>
-                    <span><strong>Persistent Accounts:</strong> Secure registration with custom OTP verification and temporary email blacklisting.</span>
+                    <span><strong>Verified Accounts:</strong> Sign up with your email and confirm it from the link we send. Disposable email addresses are not accepted.</span>
                   </li>
                 </ul>
               </div>
@@ -1772,6 +1073,7 @@ export default function App() {
  
             {/* Right Side: Form Block (Login or Sign Up with passwords) */}
             <div className="md:col-span-5 bg-white border border-slate-200 rounded-2xl p-6 shadow-sm text-left space-y-4">
+              {!authUser && (
               <div className="flex border-b border-slate-200 shrink-0">
                 <button
                   type="button"
@@ -1792,11 +1094,63 @@ export default function App() {
                   Create Account
                 </button>
               </div>
+              )}
  
-              {authMode === "login" ? (
+              {!authReady || (authUser && !profileLoaded) ? (
+                <div className="py-10 text-center text-xs text-slate-500">Loading…</div>
+              ) : authUser && !authUser.emailVerified ? (
                 <div className="space-y-4 text-xs">
-                  {!otpSent ? (
-                    <form onSubmit={handleSendLoginOTP} className="space-y-4">
+                  <h3 className="text-sm font-bold text-slate-800">Verify your email</h3>
+                  <p className="text-slate-600 leading-relaxed">
+                    We sent a verification link to <strong>{authUser.email}</strong>. Open it, then come back and press the button below.
+                    Check your spam folder if you can't find it.
+                  </p>
+                  <button type="button" onClick={handleCheckVerified} disabled={authBusy} className="w-full py-2.5 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-lg shadow-sm cursor-pointer flex items-center justify-center gap-1.5 transition-all text-xs disabled:opacity-50">
+                    {authBusy ? "Checking..." : "I've verified my email"} <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                  <div className="flex gap-2">
+                    <button type="button" onClick={handleResendVerification} disabled={authBusy} className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-lg cursor-pointer transition-all text-xs disabled:opacity-50">
+                      Resend email
+                    </button>
+                    <button type="button" onClick={handleLogout} className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-lg cursor-pointer transition-all text-xs">
+                      Use another account
+                    </button>
+                  </div>
+                </div>
+              ) : authUser && !profile ? (
+                <form onSubmit={handleCompleteProfile} className="space-y-4 text-xs">
+                  <h3 className="text-sm font-bold text-slate-800">Finish your profile</h3>
+                  <p className="text-slate-600">Choose the name and username other people will see.</p>
+                      <div className="space-y-1">
+                        <label className="block text-[10px] font-bold text-slate-500 uppercase">Your Full Name</label>
+                        <input
+                          type="text"
+                          required
+                          value={profileName}
+                          onChange={(e) => setProfileName(e.target.value)}
+                          placeholder="e.g. David Thompson"
+                          className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="block text-[10px] font-bold text-slate-500 uppercase">Choose a Username</label>
+                        <input
+                          type="text"
+                          required
+                          value={profileUsername}
+                          onChange={(e) => setProfileUsername(e.target.value)}
+                          placeholder="e.g. david99"
+                          className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white"
+                        />
+                      </div>
+                  <button type="submit" disabled={authBusy} className="w-full py-2.5 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-lg shadow-sm cursor-pointer flex items-center justify-center gap-1.5 transition-all text-xs disabled:opacity-50">
+                    {authBusy ? "Saving..." : "Save profile"} <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                  <button type="button" onClick={handleLogout} className="w-full text-slate-500 hover:text-slate-800 text-[11px] cursor-pointer">Sign out</button>
+                </form>
+              ) : authMode === "login" ? (
+                <div className="space-y-4 text-xs">
+                    <form onSubmit={handleLogin} className="space-y-4">
                       <div className="space-y-1">
                         <label className="block text-[10px] font-bold text-slate-500 uppercase">Your Email Address</label>
                         <input
@@ -1804,11 +1158,11 @@ export default function App() {
                           required
                           value={loginEmail}
                           onChange={(e) => setLoginEmail(e.target.value)}
-                          placeholder="e.g. alice@school.edu"
+                          placeholder="you@school.edu"
+                          autoComplete="email"
                           className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white"
                         />
                       </div>
-
                       <div className="space-y-1">
                         <label className="block text-[10px] font-bold text-slate-500 uppercase">Password</label>
                         <div className="relative">
@@ -1818,6 +1172,7 @@ export default function App() {
                             value={loginPassword}
                             onChange={(e) => setLoginPassword(e.target.value)}
                             placeholder="Enter your password"
+                            autoComplete="current-password"
                             className="w-full pl-3.5 pr-10 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white"
                           />
                           <button
@@ -1830,79 +1185,17 @@ export default function App() {
                         </div>
                       </div>
 
-                      <p className="text-[10px] text-slate-500 leading-relaxed bg-slate-50 p-2.5 rounded-lg border border-slate-100">
-                        💡 Seeded student accounts:
-                        <br />• <strong>alice@school.edu</strong> (pwd: study123)
-                        <br />• <strong>bob@school.edu</strong> (pwd: study123)
-                        <br />• <strong>clara@school.edu</strong> (pwd: study123)
-                      </p>
-
-                      <button
-                        type="submit"
-                        disabled={otpLoading}
-                        className="w-full py-2.5 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-lg shadow-sm cursor-pointer flex items-center justify-center gap-1.5 transition-all text-xs disabled:opacity-50"
-                      >
-                        {otpLoading ? "Sending Code..." : "Send Verification OTP"} <ArrowRight className="w-3.5 h-3.5" />
+                      <button type="submit" disabled={authBusy} className="w-full py-2.5 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-lg shadow-sm cursor-pointer flex items-center justify-center gap-1.5 transition-all text-xs disabled:opacity-50">
+                        {authBusy ? "Signing in..." : "Sign In"} <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                      <button type="button" onClick={handleForgotPassword} className="w-full text-sky-600 hover:underline text-[11px] cursor-pointer">
+                        Forgot your password?
                       </button>
                     </form>
-                  ) : (
-                    <form onSubmit={handleVerifyLogin} className="space-y-4">
-                      <div className="bg-emerald-50 border border-emerald-100 rounded-lg p-3 text-[11px] text-emerald-800">
-                        🔒 <strong>Step 2 of 2: OTP Verification</strong>
-                        <br />A 6-digit verification code was successfully sent to <strong>{loginEmail}</strong>.
-                      </div>
-
-                      {/* SIMULATED EMAIL INBOX CONTAINER */}
-                      <div className="bg-sky-50 border border-sky-100 rounded-xl p-3.5 space-y-2 font-mono text-[11px] text-sky-800 shadow-inner">
-                        <div className="flex items-center gap-1.5 font-bold border-b border-sky-100 pb-1.5">
-                          <span className="animate-pulse text-sky-600">●</span>
-                          <span>🔒 Simulated Email Inbox</span>
-                        </div>
-                        <p><strong>From:</strong> Gatekeeper Security Service &lt;otp@gatekeeper.local&gt;</p>
-                        <p><strong>To:</strong> {loginEmail}</p>
-                        <p><strong>Subject:</strong> {simulatedOtp} is your dynamic Gatekeeper login verification code</p>
-                        <div className="mt-2 text-center bg-white border border-sky-200 py-2.5 rounded-lg">
-                          <p className="text-[10px] text-slate-500 uppercase tracking-widest font-sans font-bold">Your OTP Code</p>
-                          <span className="text-xl font-extrabold tracking-widest text-sky-900">{simulatedOtp}</span>
-                        </div>
-                      </div>
-
-                      <div className="space-y-1">
-                        <label className="block text-[10px] font-bold text-slate-500 uppercase">Enter 6-Digit Code</label>
-                        <input
-                          type="text"
-                          required
-                          maxLength={6}
-                          value={otpCode}
-                          onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, ""))}
-                          placeholder="e.g. 123456"
-                          className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white text-center text-lg tracking-widest font-mono"
-                        />
-                      </div>
-
-                      <div className="flex gap-2">
-                        <button
-                          type="button"
-                          onClick={() => { setOtpSent(false); setOtpCode(""); }}
-                          className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-lg cursor-pointer transition-all text-xs"
-                        >
-                          Change Email
-                        </button>
-                        <button
-                          type="submit"
-                          disabled={otpLoading}
-                          className="flex-[2] py-2.5 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-lg shadow-sm cursor-pointer flex items-center justify-center gap-1.5 transition-all text-xs disabled:opacity-50"
-                        >
-                          {otpLoading ? "Verifying..." : "Verify & Sign In"} <ArrowRight className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </form>
-                  )}
                 </div>
               ) : (
                 <div className="space-y-4 text-xs">
-                  {!otpSent ? (
-                    <form onSubmit={handleSendRegisterOTP} className="space-y-4">
+                    <form onSubmit={handleRegister} className="space-y-4">
                       <div className="space-y-1">
                         <label className="block text-[10px] font-bold text-slate-500 uppercase">Your Full Name</label>
                         <input
@@ -1914,7 +1207,6 @@ export default function App() {
                           className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white"
                         />
                       </div>
-
                       <div className="space-y-1">
                         <label className="block text-[10px] font-bold text-slate-500 uppercase">Choose a Username</label>
                         <input
@@ -1926,28 +1218,28 @@ export default function App() {
                           className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white"
                         />
                       </div>
-
                       <div className="space-y-1">
-                        <label className="block text-[10px] font-bold text-slate-500 uppercase">School or Personal Email (No temporary domains)</label>
+                        <label className="block text-[10px] font-bold text-slate-500 uppercase">Your Email Address</label>
                         <input
                           type="email"
                           required
                           value={regEmail}
                           onChange={(e) => setRegEmail(e.target.value)}
-                          placeholder="e.g. david99@school.edu"
+                          placeholder="you@school.edu"
+                          autoComplete="email"
                           className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white"
                         />
                       </div>
-
                       <div className="space-y-1">
-                        <label className="block text-[10px] font-bold text-slate-500 uppercase">Set a Password</label>
+                        <label className="block text-[10px] font-bold text-slate-500 uppercase">Password</label>
                         <div className="relative">
                           <input
                             type={showRegPassword ? "text" : "password"}
                             required
                             value={regPassword}
                             onChange={(e) => setRegPassword(e.target.value)}
-                            placeholder="Minimum 4 characters"
+                            placeholder="At least 6 characters"
+                            autoComplete="new-password"
                             className="w-full pl-3.5 pr-10 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white"
                           />
                           <button
@@ -1960,67 +1252,11 @@ export default function App() {
                         </div>
                       </div>
 
-                      <button
-                        type="submit"
-                        disabled={otpLoading}
-                        className="w-full py-2.5 bg-sky-600 hover:bg-sky-500 text-white font-extrabold rounded-lg shadow-sm cursor-pointer flex items-center justify-center gap-1.5 transition-all text-xs disabled:opacity-50"
-                      >
-                        {otpLoading ? "Sending OTP..." : "Send Verification OTP"} <ArrowRight className="w-3.5 h-3.5" />
+                      <button type="submit" disabled={authBusy} className="w-full py-2.5 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-lg shadow-sm cursor-pointer flex items-center justify-center gap-1.5 transition-all text-xs disabled:opacity-50">
+                        {authBusy ? "Creating account..." : "Create Account"} <ArrowRight className="w-3.5 h-3.5" />
                       </button>
+                      <p className="text-[10px] text-slate-500 leading-relaxed">We'll email you a link to confirm your address before you can chat.</p>
                     </form>
-                  ) : (
-                    <form onSubmit={handleVerifyAndRegister} className="space-y-4">
-                      <div className="bg-emerald-50 border border-emerald-100 rounded-lg p-3 text-[11px] text-emerald-800">
-                        🔒 <strong>Step 2 of 2: OTP Verification</strong>
-                        <br />We have sent a verification code to your email address: <strong>{regEmail}</strong>.
-                      </div>
-
-                      {/* SIMULATED EMAIL INBOX CONTAINER */}
-                      <div className="bg-sky-50 border border-sky-100 rounded-xl p-3.5 space-y-2 font-mono text-[11px] text-sky-800 shadow-inner">
-                        <div className="flex items-center gap-1.5 font-bold border-b border-sky-100 pb-1.5">
-                          <span className="animate-pulse text-sky-600">●</span>
-                          <span>🔒 Simulated Email Inbox</span>
-                        </div>
-                        <p><strong>From:</strong> Gatekeeper Security Service &lt;otp@gatekeeper.local&gt;</p>
-                        <p><strong>To:</strong> {regEmail}</p>
-                        <p><strong>Subject:</strong> {simulatedOtp} is your dynamic Gatekeeper registration code</p>
-                        <div className="mt-2 text-center bg-white border border-sky-200 py-2.5 rounded-lg">
-                          <p className="text-[10px] text-slate-500 uppercase tracking-widest font-sans font-bold">Your OTP Code</p>
-                          <span className="text-xl font-extrabold tracking-widest text-sky-900">{simulatedOtp}</span>
-                        </div>
-                      </div>
-
-                      <div className="space-y-1">
-                        <label className="block text-[10px] font-bold text-slate-500 uppercase">Enter 6-Digit Code</label>
-                        <input
-                          type="text"
-                          required
-                          maxLength={6}
-                          value={otpCode}
-                          onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, ""))}
-                          placeholder="e.g. 123456"
-                          className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white text-center text-lg tracking-widest font-mono"
-                        />
-                      </div>
-
-                      <div className="flex gap-2">
-                        <button
-                          type="button"
-                          onClick={() => { setOtpSent(false); setOtpCode(""); }}
-                          className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-lg cursor-pointer transition-all text-xs"
-                        >
-                          Go Back
-                        </button>
-                        <button
-                          type="submit"
-                          disabled={otpLoading}
-                          className="flex-[2] py-2.5 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-lg shadow-sm cursor-pointer flex items-center justify-center gap-1.5 transition-all text-xs disabled:opacity-50"
-                        >
-                          {otpLoading ? "Creating..." : "Verify & Create Account"} <ArrowRight className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </form>
-                  )}
                 </div>
               )}
             </div>
@@ -2037,7 +1273,7 @@ export default function App() {
             {/* Active User Persona Badge with Logout */}
             <div className="p-4 border-b border-slate-200 bg-slate-100/30">
               <div className="flex items-center justify-between">
-                <label className="block text-[10px] font-bold text-sky-700 uppercase tracking-wider">Simulated Identity</label>
+                <label className="block text-[10px] font-bold text-sky-700 uppercase tracking-wider">Signed in as</label>
                 <button
                   onClick={handleLogout}
                   className="text-slate-500 hover:text-rose-600 flex items-center gap-1 text-[10px] font-bold transition-colors cursor-pointer"
@@ -2097,12 +1333,12 @@ export default function App() {
                 ) : (
                   <div className="flex items-center justify-between text-slate-500 text-[9px] leading-tight">
                     <span className="flex items-center gap-0.5">
-                      <Monitor className="w-3 h-3 text-emerald-500" /> Native App (.EXE / APK) ready
+                      <Monitor className="w-3 h-3 text-emerald-500" /> System alerts on
                     </span>
                     <button
                       onClick={() => {
                         // Trigger test
-                        const testNotif = new Notification("Academic Chat Sandbox", {
+                        const testNotif = new Notification("Gatekeeper Chat", {
                           body: "Great! Native system push alerts are fully working.",
                           icon: "/favicon.ico"
                         });
@@ -2357,6 +1593,13 @@ export default function App() {
                             <span className="flex items-center gap-1">
                               <Clock className="w-2.5 h-2.5" />
                               {new Date(n.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                              <button
+                                onClick={() => dismissWarning(n.id)}
+                                className="ml-1 text-slate-400 hover:text-rose-600 cursor-pointer"
+                                title="Dismiss this warning"
+                              >
+                                <XCircle className="w-3 h-3" />
+                              </button>
                             </span>
                           </div>
                           <div className="text-[10px] bg-slate-50 p-2 rounded border border-slate-150 text-slate-600 font-mono italic my-1 break-words line-clamp-3">
@@ -2693,7 +1936,7 @@ export default function App() {
                                         href="#"
                                         onClick={(e) => {
                                           e.preventDefault();
-                                          alert(`Simulated URL retrieval:\n${m.fileUrl || m.fileName}`);
+                                          openAttachment(m);
                                         }}
                                         className={`text-[9px] font-bold shrink-0 hover:underline ${
                                           isMyMessage ? "text-white" : "text-sky-600"
@@ -2854,7 +2097,6 @@ export default function App() {
                             type="button"
                             onClick={() => {
                               setAttachedFile(null);
-                              setFileContent("");
                               setFileBase64("");
                               if (fileInputRef.current) fileInputRef.current.value = "";
                             }}
@@ -3130,7 +2372,7 @@ export default function App() {
                                     href="#"
                                     onClick={(e) => {
                                       e.preventDefault();
-                                      alert(`Simulated URL retrieval:\n${m.fileUrl || m.fileName}`);
+                                      openAttachment(m);
                                     }}
                                     className="text-[10px] font-bold text-sky-600 hover:underline flex items-center gap-1 shrink-0 bg-sky-50 px-2 py-0.5 rounded transition-all hover:bg-sky-100"
                                   >

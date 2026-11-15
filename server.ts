@@ -1,89 +1,59 @@
-import express from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
+import fs from "fs";
 import path from "path";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { initializeApp } from "firebase-admin/app";
+import { getAuth, type DecodedIdToken } from "firebase-admin/auth";
+import { getFirestore, FieldValue, type Firestore } from "firebase-admin/firestore";
+import { getStorage } from "firebase-admin/storage";
 
 dotenv.config();
 
+/* ------------------------------------------------------------------ *
+ * Firebase Admin
+ *
+ * The server is the only thing that writes users, groups, messages,
+ * warnings and logs (see firestore.rules). It verifies the caller's
+ * Firebase ID token on every request, so moderation can't be skipped.
+ *
+ * Credentials: Application Default Credentials (Cloud Run / AI Studio
+ * provide them; locally set GOOGLE_APPLICATION_CREDENTIALS to a service
+ * account key). With FIRESTORE_EMULATOR_HOST, FIREBASE_AUTH_EMULATOR_HOST
+ * and FIREBASE_STORAGE_EMULATOR_HOST set, it talks to the emulators.
+ * ------------------------------------------------------------------ */
+const firebaseConfig = JSON.parse(
+  fs.readFileSync(path.join(process.cwd(), "firebase-applet-config.json"), "utf8")
+);
+const adminApp = initializeApp({
+  projectId: firebaseConfig.projectId,
+  storageBucket: firebaseConfig.storageBucket,
+});
+const adminAuth = getAuth(adminApp);
+const db: Firestore =
+  firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== "(default)"
+    ? getFirestore(adminApp, firebaseConfig.firestoreDatabaseId)
+    : getFirestore(adminApp);
+const bucket = getStorage(adminApp).bucket();
+
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
 
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
-const otpStore: { [email: string]: { otp: string, expiresAt: number } } = {};
-
+const TEMP_EMAIL_DOMAINS = [
+  "mailinator.com", "tempmail.com", "temp-mail.org", "10minutemail.com",
+  "yopmail.com", "trashmail.com", "disposable.com", "generator.com", "fake.com",
+  "guerrillamail.com", "sharklasers.com", "getairmail.com", "dispostable.com", "maildrop.cc",
+  "tempmail.net", "tempmail.co", "crazymailing.com", "throwawaymail.com", "mailnesia.com",
+  "disposablemail.com", "tempmailaddress.com", "safe-mail.net", "yopmail.fr", "yopmail.net",
+];
 function isTemporaryEmail(email: string): boolean {
-  const tempDomains = [
-    "mailinator.com", "tempmail.com", "temp-mail.org", "10minutemail.com",
-    "yopmail.com", "trashmail.com", "disposable.com", "generator.com", "fake.com",
-    "guerrillamail.com", "sharklasers.com", "getairmail.com", "dispostable.com", "maildrop.cc",
-    "tempmail.net", "tempmail.co", "crazymailing.com", "throwawaymail.com", "mailnesia.com",
-    "disposablemail.com", "tempmailaddress.com", "safe-mail.net", "yopmail.fr", "yopmail.net"
-  ];
   const parts = email.trim().toLowerCase().split("@");
   if (parts.length < 2) return true;
-  const domain = parts[1];
-  return tempDomains.includes(domain);
+  return TEMP_EMAIL_DOMAINS.includes(parts[1]);
 }
-
-// OTP Endpoint to generate and send (via simulated response and logs)
-app.post("/api/auth/send-otp", (req, res) => {
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: "Email is required." });
-  }
-
-  if (isTemporaryEmail(email)) {
-    return res.status(400).json({
-      error: "Temporary/disposable email addresses are strictly prohibited for security reasons. Please register with a valid school or personal email."
-    });
-  }
-
-  // Generate 6-digit random OTP
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const normalizedEmail = email.trim().toLowerCase();
-  
-  otpStore[normalizedEmail] = {
-    otp,
-    expiresAt: Date.now() + 5 * 60 * 1000 // 5 minutes expiration
-  };
-
-  console.log(`[GATEKEEPER SERVICE] Verification OTP generated for ${normalizedEmail}: ${otp}`);
-
-  res.json({
-    success: true,
-    message: "A simulated verification code has been sent to your email address.",
-    otp, // Expose for testing/reviewing
-  });
-});
-
-app.post("/api/auth/verify-otp", (req, res) => {
-  const { email, otp } = req.body;
-  if (!email || !otp) {
-    return res.status(400).json({ error: "Email and OTP are required." });
-  }
-
-  const normalizedEmail = email.trim().toLowerCase();
-  const record = otpStore[normalizedEmail];
-
-  if (!record) {
-    return res.status(400).json({ error: "No active verification code found for this email address. Please send a code first." });
-  }
-
-  if (Date.now() > record.expiresAt) {
-    delete otpStore[normalizedEmail];
-    return res.status(400).json({ error: "The verification code has expired. Please request a new one." });
-  }
-
-  if (record.otp !== otp.trim()) {
-    return res.status(400).json({ error: "Invalid verification code. Please check the code and try again." });
-  }
-
-  // Verification successful! Clean up OTP.
-  delete otpStore[normalizedEmail];
-  res.json({ success: true, message: "Email verified successfully!" });
-});
 
 // Initialize Gemini Client Lazily/Safely
 let ai: GoogleGenAI | null = null;
@@ -185,94 +155,6 @@ async function generateContentWithRetry(aiClient: any, params: any, maxRetries =
   throw lastError;
 }
 
-// Interfaces (Matches types.ts)
-interface User {
-  uid: string;
-  name: string;
-  username: string;
-  password?: string;
-  email?: string;
-  emailVerified?: boolean;
-  groups: string[]; // Joined group IDs
-}
-
-interface Group {
-  id: string;
-  name: string;
-  description: string;
-  members: string[]; // User IDs
-  createdBy?: string;
-}
-
-interface Message {
-  id: string;
-  groupId?: string;
-  recipientId?: string;
-  senderId: string;
-  senderName: string;
-  senderEmail?: string;
-  text?: string;
-  fileUrl?: string;
-  fileName?: string;
-  fileType?: "PDF" | "Video" | "Image" | "Word" | "PPT" | "YouTube" | "Other";
-  fileDescription?: string;
-  timestamp: string;
-  approvedAt?: string;
-}
-
-interface Notification {
-  id: string;
-  userId: string;
-  messageId: string;
-  messageText: string;
-  explanation: string;
-  timestamp: string;
-}
-
-interface GatekeeperLog {
-  id: string;
-  timestamp: string;
-  type: "PENDING" | "APPROVED" | "REJECTED" | "INFO";
-  details: string;
-  data: any;
-}
-
-// Initial Seeding
-let dbUsers: User[] = [
-  { uid: "user_alice", name: "Alice Jenkins", username: "alice", password: "study123", email: "alice@school.edu", emailVerified: true, groups: [] },
-  { uid: "user_bob", name: "Bob Miller", username: "bob", password: "study123", email: "bob@school.edu", emailVerified: true, groups: [] },
-  { uid: "user_clara", name: "Prof. Clara", username: "clara", password: "study123", email: "clara@school.edu", emailVerified: true, groups: [] },
-];
-
-let dbGroups: Group[] = [];
-
-let dbMessages: Message[] = [];
-
-let dbPendingMessages: Message[] = [];
-let dbNotifications: Notification[] = [];
-let dbLogs: GatekeeperLog[] = [
-  {
-    id: "log_init",
-    timestamp: new Date().toISOString(),
-    type: "INFO",
-    details: "Gatekeeper Universal Chat Sandbox initialized successfully. No pre-set groups loaded.",
-    data: { activeGroupsCount: 0, loadedUsersCount: 3 },
-  },
-];
-
-// Helper to write sandbox logs
-function addLog(type: GatekeeperLog["type"], details: string, data: any = {}) {
-  const log: GatekeeperLog = {
-    id: `log_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-    timestamp: new Date().toISOString(),
-    type,
-    details,
-    data,
-  };
-  dbLogs.unshift(log);
-  if (dbLogs.length > 100) dbLogs.pop(); // Cap at 100
-}
-
 // Fallback moderation (regex & heuristics based)
 function runFallbackModeration(
   text: string,
@@ -309,14 +191,6 @@ function runFallbackModeration(
         };
       }
     }
-  }
-
-  // 2. Custom Inorganic Chemistry Override / Bypass rule
-  if (text && (text.toLowerCase().includes("let's study inorganic chem") || text.toLowerCase().includes("alice's account to bob's account"))) {
-    return {
-      status: "APPROVED",
-      explanation: "Approved: The query explicitly focuses on Inorganic Chemistry study, assignments, and educational accounts mapping, which is fully aligned with approved academic collaboration policies.",
-    };
   }
 
   // 3. Group Dynamic Topic Check
@@ -406,593 +280,579 @@ async function extractAndFetchYouTubeMetadata(text: string): Promise<string> {
   return metadataStr;
 }
 
-// REST endpoints
 
-// 1. Get status & configuration
-app.get("/api/config", (req, res) => {
-  const isQuotaActive = isGeminiQuotaActive();
-  res.json({
-    geminiActive: !!ai && !isQuotaActive,
-    apiModel: "gemini-3.5-flash",
-    fallbackEnabled: !ai || isQuotaActive,
-  });
-});
+// Data shapes stored in Firestore (match src/types.ts)
+type FileKind = "PDF" | "Video" | "Image" | "Word" | "PPT" | "YouTube" | "Other";
 
-// 2. Clear / Reset Sandbox
-app.post("/api/reset", (req, res) => {
-  dbUsers = [
-    { uid: "user_alice", name: "Alice Jenkins", username: "alice", password: "study123", email: "alice@school.edu", emailVerified: true, groups: [] },
-    { uid: "user_bob", name: "Bob Miller", username: "bob", password: "study123", email: "bob@school.edu", emailVerified: true, groups: [] },
-    { uid: "user_clara", name: "Prof. Clara", username: "clara", password: "study123", email: "clara@school.edu", emailVerified: true, groups: [] },
-  ];
+interface UserProfile {
+  uid: string;
+  name: string;
+  username: string;
+  email: string;
+  groups: string[];
+  createdAt: string;
+}
 
-  dbGroups = [];
-  dbMessages = [];
+interface Group {
+  id: string;
+  name: string;
+  description: string;
+  members: string[];
+  createdBy: string;
+  createdAt: string;
+}
 
-  dbPendingMessages = [];
-  dbNotifications = [];
-  dbLogs = [
-    {
-      id: "log_reset",
-      timestamp: new Date().toISOString(),
-      type: "INFO",
-      details: "Database reset to clean state with no active groups or messages.",
-      data: { activeGroupsCount: 0, loadedUsersCount: 3 },
-    },
-  ];
+interface Message {
+  id: string;
+  kind: "group" | "dm";
+  groupId?: string;
+  recipientId?: string;
+  participants?: string[]; // DMs: the two people
+  dmKey?: string;          // DMs: the two uids, sorted, joined with "__"
+  audience: string[];      // who could read it when it was sent (used for alerts)
+  senderId: string;
+  senderName: string;
+  text?: string;
+  fileName?: string;
+  fileType?: FileKind;
+  fileDescription?: string;
+  fileMime?: string;
+  fileSize?: number;
+  filePath?: string;       // object path in Cloud Storage; served by GET /api/messages/:id/file
+  timestamp: string;
+  approvedAt?: string;
+  friendlyPoliteFilter?: boolean;
+  replyToId?: string;
+  replyToSenderName?: string;
+  replyToText?: string;
+  isForwarded?: boolean;
+  originalSenderName?: string;
+}
 
-  res.json({ success: true, message: "Database reseeded successfully." });
-});
+type Decision = { status: "APPROVED" | "REJECTED"; explanation: string };
 
-// 3. User Login Simulation (No emails required)
-app.post("/api/auth/login", (req, res) => {
-  const { username } = req.body;
-  if (!username) {
-    return res.status(400).json({ error: "Username is required." });
-  }
+function clean<T extends object>(obj: T): T {
+  const out: any = {};
+  for (const [k, v] of Object.entries(obj)) if (v !== undefined) out[k] = v;
+  return out;
+}
 
-  // Look up user by username or exact match
-  const user = dbUsers.find(
-    u => u.username.toLowerCase() === username.trim().toLowerCase() ||
-         u.name.toLowerCase() === username.trim().toLowerCase()
-  );
-  if (!user) {
-    return res.status(400).json({ error: `No user found with username "${username}". Feel free to Register a new profile instantly!` });
-  }
+function dmKeyOf(a: string, b: string) {
+  return [a, b].sort().join("__");
+}
 
-  addLog("INFO", `User logged in: ${user.name} (@${user.username})`, { userId: user.uid });
-  res.json({ success: true, user });
-});
+function fileKindOf(name: string): FileKind {
+  const ext = name.split(".").pop()?.toLowerCase() || "";
+  if (ext === "pdf") return "PDF";
+  if (["doc", "docx"].includes(ext)) return "Word";
+  if (["ppt", "pptx"].includes(ext)) return "PPT";
+  if (["mp4", "mov", "avi", "webm", "mkv"].includes(ext)) return "Video";
+  if (["png", "jpg", "jpeg", "webp", "gif"].includes(ext)) return "Image";
+  return "Other";
+}
 
-// 4. User Registration Simulation (No emails required)
-app.post("/api/auth/register", (req, res) => {
-  const { name, username } = req.body;
-  if (!name || !username) {
-    return res.status(400).json({ error: "Name and Username are required." });
-  }
+const TEXT_EXTENSIONS = ["txt", "py", "js", "ts", "json", "md", "csv", "html", "css", "xml", "yaml", "yml", "sql", "sh"];
 
-  const normalizedUsername = username.trim().toLowerCase();
-  const exists = dbUsers.find(u => u.username.toLowerCase() === normalizedUsername);
-  if (exists) {
-    return res.status(400).json({ error: `A simulated user with username @${username} already exists.` });
-  }
-
-  const newUser: User = {
-    uid: `user_${Date.now()}`,
-    name: name.trim(),
-    username: normalizedUsername,
-    groups: [], // Empty initially, must be invited to join study rooms
+function mimeOf(name: string, given?: string): string {
+  if (given && /^[\w.+-]+\/[\w.+-]+$/.test(given)) return given;
+  const ext = name.split(".").pop()?.toLowerCase() || "";
+  const map: Record<string, string> = {
+    pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif",
+    mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", txt: "text/plain", md: "text/markdown", csv: "text/csv",
+    json: "application/json", doc: "application/msword",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ppt: "application/vnd.ms-powerpoint",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
   };
+  return map[ext] || "application/octet-stream";
+}
 
-  dbUsers.push(newUser);
+function safeFileName(name: string) {
+  const base = path.basename(String(name || "file")).replace(/[^\w.\- ()]+/g, "_").slice(0, 120);
+  return base || "file";
+}
 
-  addLog("INFO", `New simulated user registered: ${name} (@${normalizedUsername})`, { userId: newUser.uid });
-  res.json({ success: true, user: newUser });
-});
+/* ---------------------------- auth ---------------------------- */
+interface AuthedRequest extends Request {
+  user: DecodedIdToken;
+}
 
-// 5. Get List of Users
-app.get("/api/users", (req, res) => {
-  res.json(dbUsers);
-});
-
-// 6. Get Groups
-app.get("/api/groups", (req, res) => {
-  res.json(dbGroups);
-});
-
-// 7. Get Messages for Group (Enforces strict inside-group membership authorization)
-app.get("/api/groups/:groupId/messages", (req, res) => {
-  const { groupId } = req.params;
-  const { userId } = req.query;
-
-  const group = dbGroups.find(g => g.id === groupId);
-  if (!group) {
-    return res.status(404).json({ error: "Group not found." });
-  }
-
-  if (!userId) {
-    return res.status(400).json({ error: "userId parameter is required to authorize read access." });
-  }
-
-  const isMember = group.members.includes(userId as string);
-  if (!isMember) {
-    return res.status(403).json({ error: "Access Denied. You must join this group before you can read or fetch messages." });
-  }
-
-  const messages = dbMessages.filter(m => m.groupId === groupId);
-  res.json(messages);
-});
-
-// 8. Add person to a group (authorized to existing group members only)
-app.post("/api/groups/:groupId/add-member", (req, res) => {
-  const { groupId } = req.params;
-  const { senderId, userIdToAdd } = req.body;
-
-  const group = dbGroups.find(g => g.id === groupId);
-  const userToAdd = dbUsers.find(u => u.uid === userIdToAdd);
-  const sender = dbUsers.find(u => u.uid === senderId);
-
-  if (!group || !userToAdd || !sender) {
-    return res.status(404).json({ error: "Group, user to add, or action sender not found." });
-  }
-
-  // Authorize: sender must be in the group to add others
-  if (!group.members.includes(senderId)) {
-    return res.status(403).json({ error: "Access Denied. Only existing members of the group can add new people." });
-  }
-
-  if (!group.members.includes(userIdToAdd)) {
-    group.members.push(userIdToAdd);
-  }
-
-  if (!userToAdd.groups.includes(groupId)) {
-    userToAdd.groups.push(groupId);
-  }
-
-  addLog("INFO", `${sender.name} added ${userToAdd.name} to ${group.name}`, { groupId, senderId, userIdToAdd });
-  res.json({ success: true, group });
-});
-
-// 9. Get One-on-One Direct Messages (DMs) between two users
-app.get("/api/dms/:userId/:recipientId", (req, res) => {
-  const { userId, recipientId } = req.params;
-  
-  // Filter messages that belong strictly to this 1-on-1 pair
-  const privateDMs = dbMessages.filter(
-    m => (m.senderId === userId && m.recipientId === recipientId) ||
-         (m.senderId === recipientId && m.recipientId === userId)
-  );
-
-  res.json(privateDMs);
-});
-
-// 10. Get Notifications for User
-app.get("/api/notifications/:userId", (req, res) => {
-  const { userId } = req.params;
-  const userNotifications = dbNotifications.filter(n => n.userId === userId);
-  res.json(userNotifications);
-});
-
-// 11. Join Group manually (Disabled: Rooms are strictly invite-only)
-app.post("/api/groups/join", (req, res) => {
-  return res.status(403).json({ error: "Self-enrollment or direct joining is disabled. You must be invited to this room by an existing group member." });
-});
-
-// 12. Get Gatekeeper Logs
-app.get("/api/logs", (req, res) => {
-  res.json(dbLogs);
-});
-
-// 12b. Standalone Gemini Evaluation API
-app.post("/api/evaluate", async (req, res) => {
-  const { text, fileName, fileType, fileDescription, fileContent, fileBase64, groupName, groupDescription, isDM, friendlyPoliteFilter } = req.body;
-  const startTime = Date.now();
-  let decision: { status: "APPROVED" | "REJECTED"; explanation: string };
-
-  // 1. Check for empty/neutral input
-  if (!text?.trim() && !fileName?.trim() && !fileContent?.trim() && !fileBase64?.trim()) {
-    return res.json({
-      status: "APPROVED",
-      explanation: "Approved empty or neutral content.",
-      latencyMs: Date.now() - startTime,
-    });
-  }
-
-  // 2. Check for custom inorganic chemistry override
-  if (text && (text.toLowerCase().includes("let's study inorganic chem from alice's account to bob's account") || text.toLowerCase() === "let's study inorganic chem from alice's account to bob's account")) {
-    return res.json({
-      status: "APPROVED",
-      explanation: "Approved: The query explicitly focuses on Inorganic Chemistry study, assignments, and educational accounts mapping, which is fully aligned with approved academic collaboration policies.",
-      latencyMs: Date.now() - startTime,
-    });
-  }
-
-  // Prior to moderation: extract and fetch YouTube metadata
-  const ytMetadata = await extractAndFetchYouTubeMetadata(text || "");
-
-  if (ai && !isGeminiQuotaActive()) {
+function authed(requireVerified: boolean) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const m = (req.headers.authorization || "").match(/^Bearer (.+)$/);
+    if (!m) return res.status(401).json({ error: "Please sign in." });
     try {
-      let contents: any[] = [];
-      let systemInstruction = "";
-      let promptText = "";
+      const token = await adminAuth.verifyIdToken(m[1]);
+      if (requireVerified && !token.email_verified) {
+        return res.status(403).json({ error: "Please verify your email address first." });
+      }
+      (req as AuthedRequest).user = token;
+      next();
+    } catch {
+      res.status(401).json({ error: "Your session has expired. Please sign in again." });
+    }
+  };
+}
+const signedIn = authed(false);
+const verified = authed(true);
 
-      if (isDM) {
-        if (friendlyPoliteFilter) {
-          systemInstruction = "You are an AI Gatekeeper Moderator for a direct private chat. A Friendly & Polite filter is ENABLED. Your primary directive is to ensure that the user's message is respectful, polite, friendly, and free of rudeness, hostilty, sarcasm, swearing, or passive-aggressive remarks. You must reject any message containing insulting language, toxicity, or explicit swearing. Normal greetings and friendly chat are APPROVED. If REJECTED, write a brief, polite explanation of which part was impolite and suggest how it could be rephrased.";
-          promptText = `Evaluate this direct private message to see if it is polite, friendly, and respectful:
+function route(fn: (req: AuthedRequest, res: Response) => Promise<any>) {
+  return (req: Request, res: Response) => {
+    fn(req as AuthedRequest, res).catch((err) => {
+      console.error(`${req.method} ${req.path} failed:`, err);
+      if (!res.headersSent) res.status(500).json({ error: "Something went wrong. Please try again." });
+    });
+  };
+}
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+function routeE(fn: (req: AuthedRequest, res: Response) => Promise<any>) {
+  return route(async (req, res) => {
+    try {
+      await fn(req, res);
+    } catch (e) {
+      if (e instanceof HttpError) return res.status(e.status).json({ error: e.message });
+      throw e;
+    }
+  });
+}
+
+async function getProfile(uid: string): Promise<UserProfile> {
+  const snap = await db.collection("users").doc(uid).get();
+  if (!snap.exists) throw new HttpError(403, "Finish setting up your profile first.");
+  return snap.data() as UserProfile;
+}
+
+async function getGroupForMember(groupId: string, uid: string): Promise<Group> {
+  const snap = await db.collection("groups").doc(String(groupId)).get();
+  if (!snap.exists) throw new HttpError(404, "Group not found.");
+  const g = snap.data() as Group;
+  if (!g.members.includes(uid)) throw new HttpError(403, "You are not a member of this group.");
+  return g;
+}
+
+async function canRead(uid: string, msg: Message): Promise<boolean> {
+  if (msg.kind === "dm") return (msg.participants || []).includes(uid);
+  if (!msg.groupId) return false;
+  const g = await db.collection("groups").doc(msg.groupId).get();
+  return g.exists && (g.data() as Group).members.includes(uid);
+}
+
+async function writeLog(userId: string, type: "APPROVED" | "REJECTED" | "INFO", details: string, data: any = {}) {
+  const ref = db.collection("logs").doc();
+  await ref.set({ id: ref.id, userId, timestamp: new Date().toISOString(), type, details, data: clean(data) });
+}
+
+/* -------------------------- moderation -------------------------- */
+interface ModerationInput {
+  text?: string;
+  fileName?: string;
+  fileType?: string;
+  fileDescription?: string;
+  fileContent?: string;
+  fileBase64?: string;
+  fileMime?: string;
+  isDM: boolean;
+  friendlyPoliteFilter?: boolean;
+  groupName?: string;
+  groupDescription?: string;
+}
+
+async function moderate(input: ModerationInput): Promise<Decision & { latencyMs: number; geminiActive: boolean }> {
+  const { text, fileName, fileType, fileDescription, fileContent, fileBase64, fileMime, isDM, friendlyPoliteFilter, groupName, groupDescription } = input;
+  const startTime = Date.now();
+  const done = (d: Decision) => ({ ...d, latencyMs: Date.now() - startTime, geminiActive: !!ai && !isGeminiQuotaActive() });
+
+  if (!text?.trim() && !fileName?.trim() && !fileContent?.trim() && !fileBase64?.trim()) {
+    return done({ status: "APPROVED", explanation: "Approved empty or neutral content." });
+  }
+
+  const ytMetadata = await extractAndFetchYouTubeMetadata(text || "");
+  const fallback = () =>
+    runFallbackModeration(text || "", fileName, fileDescription, fileContent, ytMetadata, groupName, groupDescription, isDM, friendlyPoliteFilter);
+
+  if (!ai || isGeminiQuotaActive()) return done(fallback());
+
+  try {
+    let systemInstruction = "";
+    let promptText = "";
+    if (isDM) {
+      if (friendlyPoliteFilter) {
+        systemInstruction = "You are an AI Gatekeeper Moderator for a direct private chat. A Friendly & Polite filter is ENABLED. Your primary directive is to ensure that the user's message is respectful, polite, friendly, and free of rudeness, hostility, sarcasm, swearing, or passive-aggressive remarks. You must reject any message containing insulting language, toxicity, or explicit swearing. Normal greetings and friendly chat are APPROVED. If REJECTED, write a brief, polite explanation of which part was impolite and suggest how it could be rephrased.";
+        promptText = `Evaluate this direct private message to see if it is polite, friendly, and respectful:
 - Message Text: "${text || "None provided"}"
 - Attachment Name: "${fileName || "None"}"
-- Attachment Type: "${fileType || "None"}"
+- Attachment Type: "${fileType || "None"}"${fileContent ? `\n- Attachment File Content: """\n${fileContent}\n"""` : ""}
 
 Decide whether to APPROVE this message or REJECT it for impolite, hostile, or toxic language.`;
-        } else {
-          systemInstruction = "You are an AI Moderator for a direct private chat. Always approve standard polite conversational messages unless they contain extremely harmful, illegal, or dangerous content.";
-          promptText = `Message: "${text || "None"}"`;
-        }
       } else {
-        // Group Chat - Dynamic Topic Moderation
-        const effectiveName = groupName || "General";
-        const effectiveDesc = groupDescription || "No description provided.";
-        systemInstruction = `You are an AI Gatekeeper Moderator for a custom chat group named "${effectiveName}" with description: "${effectiveDesc}".
+        systemInstruction = "You are an AI Moderator for a direct private chat. Always approve standard polite conversational messages unless they contain extremely harmful, illegal, or dangerous content.";
+        promptText = `Message: "${text || "None"}"
+- Attachment Name: "${fileName || "None"}"`;
+      }
+    } else {
+      const effectiveName = groupName || "General";
+      const effectiveDesc = groupDescription || "No description provided.";
+      systemInstruction = `You are an AI Gatekeeper Moderator for a custom chat group named "${effectiveName}" with description: "${effectiveDesc}".
 The core rule is that ALL substantive discussion must strictly match and align with the group's topic: "${effectiveName}" (and its description).
 You must REJECT any message, file, or link that deviates from this topic or introduces off-topic substance.
 - Minor social greetings, check-ins, or brief coordination (e.g. 'hello', 'how are you', 'sounds good', 'yes', 'perfect', 'okay', 'ready', 'sure', 'got it', 'thanks') are fully ALLOWED and should be APPROVED to preserve natural conversational flow.
 - However, substantive discussions on off-topic subjects (for example, video games or movies in a chemistry group, or study-stress talk in a family group) must be REJECTED.
 - If REJECTED, return REJECTED along with a brief, polite, helpful explanation of why the message is off-topic for this specific group.`;
-
-        promptText = `Evaluate this chat post to see if it stays on-topic for the group "${effectiveName}" (Topic Description: "${effectiveDesc}"):
+      promptText = `Evaluate this chat post to see if it stays on-topic for the group "${effectiveName}" (Topic Description: "${effectiveDesc}"):
 - Message Text: "${text || "None provided"}"
 - Attachment Name: "${fileName || "None"}"
 - Attachment Type: "${fileType || "None"}"${fileContent ? `\n- Attachment File Content: """\n${fileContent}\n"""` : ""}${ytMetadata}
 
 Determine whether to APPROVE (on-topic or polite greeting) or REJECT (substantive off-topic deviation).`;
-      }
+    }
 
-      if (fileBase64) {
-        const fileExt = fileName ? fileName.split('.').pop()?.toLowerCase() || "jpeg" : "jpeg";
-        const mimeType = fileExt === "png" ? "image/png" : "image/jpeg";
-        contents = [
-          {
-            inlineData: {
-              mimeType: mimeType,
-              data: fileBase64,
-            },
-          },
-          {
-            text: `${promptText}\nNote: Check if the content of this attached image is also relevant to the group's topic or respectful/friendly.`,
-          }
-        ];
-      } else {
-        contents = [promptText];
-      }
+    const contents: any[] = fileBase64
+      ? [
+          { inlineData: { mimeType: fileMime || "image/jpeg", data: fileBase64 } },
+          { text: `${promptText}\nNote: Check if the content of this attached image is also relevant to the group's topic or respectful/friendly.` },
+        ]
+      : [promptText];
 
-      const response = await generateContentWithRetry(ai, {
-        model: "gemini-3.5-flash",
-        contents: contents,
-        config: {
-          systemInstruction: systemInstruction,
-          responseMimeType: "application/json",
-          temperature: 0.1,
-          maxOutputTokens: 150,
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              status: {
-                type: Type.STRING,
-                enum: ["APPROVED", "REJECTED"],
-                description: "APPROVED if the content matches group topic / is friendly, REJECTED if off-topic or rude.",
-              },
-              explanation: {
-                type: Type.STRING,
-                description: "If REJECTED, a brief, polite explanation of why the message failed moderation. Keep brief/empty if APPROVED.",
-              },
-            },
-            required: ["status", "explanation"],
+    const response = await generateContentWithRetry(ai, {
+      model: "gemini-3.5-flash",
+      contents,
+      config: {
+        systemInstruction,
+        responseMimeType: "application/json",
+        temperature: 0.1,
+        maxOutputTokens: 150,
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            status: { type: Type.STRING, enum: ["APPROVED", "REJECTED"] },
+            explanation: { type: Type.STRING },
           },
+          required: ["status", "explanation"],
         },
-      });
-
-      const responseText = response.text || "{}";
-      const result = JSON.parse(responseText.trim());
-      decision = {
-        status: result.status || "REJECTED",
-        explanation: result.explanation || (result.status === "APPROVED" ? "Approved by Gatekeeper AI." : "No explanation provided."),
-      };
-    } catch (err: any) {
-      console.error("Gemini evaluation error:", err);
-      decision = runFallbackModeration(text || "", fileName, fileDescription, fileContent, ytMetadata, groupName, groupDescription, isDM, friendlyPoliteFilter);
-    }
-  } else {
-    decision = runFallbackModeration(text || "", fileName, fileDescription, fileContent, ytMetadata, groupName, groupDescription, isDM, friendlyPoliteFilter);
+      },
+    });
+    const result = JSON.parse((response.text || "{}").trim());
+    return done({
+      status: result.status === "APPROVED" ? "APPROVED" : "REJECTED",
+      explanation: result.explanation || (result.status === "APPROVED" ? "Approved by Gatekeeper AI." : "No explanation provided."),
+    });
+  } catch (err) {
+    console.error("Gemini evaluation error, using fallback moderation:", err);
+    return done(fallback());
   }
+}
 
-  const durationMs = Date.now() - startTime;
-  res.json({
-    status: decision.status,
-    explanation: decision.explanation,
-    latencyMs: durationMs,
-    geminiActive: !!ai && !isGeminiQuotaActive(),
-  });
+/* --------------------------- endpoints --------------------------- */
+
+app.get("/api/config", (_req, res) => {
+  const quota = isGeminiQuotaActive();
+  res.json({ geminiActive: !!ai && !quota, apiModel: "gemini-3.5-flash", fallbackEnabled: !ai || quota });
 });
 
-// 13. Post Pending Message (Evaluated dynamically for both Groups and Direct 1-on-1 Messages)
-app.post("/api/messages/send", async (req, res) => {
-  const { groupId, recipientId, senderId, text, fileUrl, fileName, fileType, fileDescription, fileContent, fileBase64 } = req.body;
+// Create the signed-in user's profile (allowed before email verification, so sign-up can do it).
+app.post("/api/profile", signedIn, routeE(async (req, res) => {
+  const uid = req.user.uid;
+  const email = (req.user.email || "").toLowerCase();
+  const name = String(req.body.name || "").trim();
+  const username = String(req.body.username || "").trim().toLowerCase();
+  if (!email) throw new HttpError(400, "Your account has no email address.");
+  if (isTemporaryEmail(email)) throw new HttpError(400, "Temporary/disposable email addresses are not allowed. Please use a school or personal email.");
+  if (name.length < 1 || name.length > 60) throw new HttpError(400, "Please enter your name (up to 60 characters).");
+  if (!/^[a-z0-9_.]{3,24}$/.test(username)) throw new HttpError(400, "Usernames are 3–24 characters: letters, numbers, dots and underscores.");
 
-  const sender = dbUsers.find(u => u.uid === senderId);
-  if (!sender) {
-    return res.status(404).json({ error: "Sender profile not found." });
-  }
+  const userRef = db.collection("users").doc(uid);
+  const nameRef = db.collection("usernames").doc(username);
+  const profile = await db.runTransaction(async (t) => {
+    const [u, n] = await Promise.all([t.get(userRef), t.get(nameRef)]);
+    if (u.exists) return u.data() as UserProfile;
+    if (n.exists && n.data()?.uid !== uid) throw new HttpError(409, `The username @${username} is taken. Please choose another.`);
+    const p: UserProfile = { uid, name, username, email, groups: [], createdAt: new Date().toISOString() };
+    t.set(nameRef, { uid });
+    t.set(userRef, p);
+    return p;
+  });
+  await writeLog(uid, "INFO", `Profile created: ${profile.name} (@${profile.username})`);
+  res.json({ success: true, user: profile });
+}));
 
-  // If group message, validate inside-group membership
-  let targetName = "";
+// Create a group. The creator is its first member.
+app.post("/api/groups", verified, routeE(async (req, res) => {
+  const me = await getProfile(req.user.uid);
+  const name = String(req.body.name || "").trim();
+  const description = String(req.body.description || "").trim();
+  if (!name || name.length > 80) throw new HttpError(400, "Please give the group a name (up to 80 characters).");
+  if (!description || description.length > 1000) throw new HttpError(400, "Please describe the group's topic (up to 1000 characters).");
+  const ref = db.collection("groups").doc();
+  const group: Group = { id: ref.id, name, description, members: [me.uid], createdBy: me.uid, createdAt: new Date().toISOString() };
+  const batch = db.batch();
+  batch.set(ref, group);
+  batch.update(db.collection("users").doc(me.uid), { groups: FieldValue.arrayUnion(ref.id) });
+  await batch.commit();
+  await writeLog(me.uid, "INFO", `Created group "${name}". Topic: "${description}"`, { groupId: ref.id });
+  res.json({ success: true, group });
+}));
+
+// Add someone to a group (only existing members can).
+app.post("/api/groups/:groupId/members", verified, routeE(async (req, res) => {
+  const me = await getProfile(req.user.uid);
+  const group = await getGroupForMember(req.params.groupId, me.uid);
+  const userId = String(req.body.userId || "");
+  const target = await db.collection("users").doc(userId).get();
+  if (!userId || !target.exists) throw new HttpError(404, "That user was not found.");
+  const batch = db.batch();
+  batch.update(db.collection("groups").doc(group.id), { members: FieldValue.arrayUnion(userId) });
+  batch.update(db.collection("users").doc(userId), { groups: FieldValue.arrayUnion(group.id) });
+  await batch.commit();
+  const t = target.data() as UserProfile;
+  await writeLog(me.uid, "INFO", `Added ${t.name} to ${group.name}`, { groupId: group.id, userId });
+  res.json({ success: true });
+}));
+
+// Leave a group.
+app.post("/api/groups/:groupId/leave", verified, routeE(async (req, res) => {
+  const me = await getProfile(req.user.uid);
+  const group = await getGroupForMember(req.params.groupId, me.uid);
+  const batch = db.batch();
+  batch.update(db.collection("groups").doc(group.id), { members: FieldValue.arrayRemove(me.uid) });
+  batch.update(db.collection("users").doc(me.uid), { groups: FieldValue.arrayRemove(group.id) });
+  await batch.commit();
+  await writeLog(me.uid, "INFO", `Left ${group.name}`, { groupId: group.id });
+  res.json({ success: true });
+}));
+
+// Live preview while typing: runs moderation for the open conversation, writes nothing.
+app.post("/api/evaluate", verified, routeE(async (req, res) => {
+  const uid = req.user.uid;
+  const { text, groupId, friendlyPoliteFilter } = req.body;
+  let group: Group | undefined;
+  if (groupId) group = await getGroupForMember(groupId, uid);
+  const d = await moderate({
+    text: typeof text === "string" ? text.slice(0, 4000) : undefined,
+    isDM: !group,
+    friendlyPoliteFilter: !group && !!friendlyPoliteFilter,
+    groupName: group?.name,
+    groupDescription: group?.description,
+  });
+  res.json(d);
+}));
+
+// Send a message (new, reply or forward). Moderated here; only approved messages are stored.
+app.post("/api/messages", verified, routeE(async (req, res) => {
+  const me = await getProfile(req.user.uid);
+  const { groupId, recipientId, replyToId, forwardOfId } = req.body;
+  const friendlyPoliteFilter = !!req.body.friendlyPoliteFilter;
+
+  // Who is it for?
+  let group: Group | undefined;
+  let recipient: UserProfile | undefined;
   if (groupId) {
-    const group = dbGroups.find(g => g.id === groupId);
-    if (!group) {
-      return res.status(404).json({ error: "Group not found." });
-    }
-    if (!group.members.includes(senderId)) {
-      return res.status(403).json({ error: "Access Denied. You must join the group before you can post messages." });
-    }
-    targetName = `group "${group.name}"`;
+    group = await getGroupForMember(groupId, me.uid);
   } else if (recipientId) {
-    const recipient = dbUsers.find(u => u.uid === recipientId);
-    if (!recipient) {
-      return res.status(404).json({ error: "Recipient not found for 1-on-1 messaging." });
-    }
-    targetName = `direct user @${recipient.username} (${recipient.name})`;
+    if (recipientId === me.uid) throw new HttpError(400, "You can't message yourself.");
+    const r = await db.collection("users").doc(String(recipientId)).get();
+    if (!r.exists) throw new HttpError(404, "Recipient not found.");
+    recipient = r.data() as UserProfile;
   } else {
-    return res.status(400).json({ error: "Either groupId or recipientId must be supplied." });
+    throw new HttpError(400, "Choose a group or a person to message.");
   }
 
-  // 1. Create and Write to pending_messages
-  const msgId = `msg_pending_${Date.now()}`;
-  const pendingMsg: Message = {
-    id: msgId,
-    groupId,
-    recipientId,
-    senderId,
-    senderName: sender.name,
+  // What is being sent?
+  let text: string | undefined = typeof req.body.text === "string" && req.body.text.trim() ? req.body.text.slice(0, 4000) : undefined;
+  let file: { name: string; mime: string; bytes?: Buffer; copyFrom?: string; size: number; type: FileKind; description?: string } | undefined;
+  let forwardedFrom: Message | undefined;
+
+  if (forwardOfId) {
+    const o = await db.collection("messages").doc(String(forwardOfId)).get();
+    if (!o.exists) throw new HttpError(404, "The message to forward was not found.");
+    forwardedFrom = o.data() as Message;
+    if (!(await canRead(me.uid, forwardedFrom))) throw new HttpError(403, "You can't forward that message.");
+    text = forwardedFrom.text;
+    if (forwardedFrom.filePath && forwardedFrom.fileName) {
+      file = {
+        name: forwardedFrom.fileName,
+        mime: forwardedFrom.fileMime || mimeOf(forwardedFrom.fileName),
+        copyFrom: forwardedFrom.filePath,
+        size: forwardedFrom.fileSize || 0,
+        type: forwardedFrom.fileType || fileKindOf(forwardedFrom.fileName),
+        description: forwardedFrom.fileDescription,
+      };
+    }
+  } else if (req.body.file && typeof req.body.file.base64 === "string") {
+    const name = safeFileName(req.body.file.name);
+    const bytes = Buffer.from(req.body.file.base64, "base64");
+    if (!bytes.length) throw new HttpError(400, "The attached file is empty.");
+    if (bytes.length > MAX_FILE_BYTES) throw new HttpError(400, "Files must be under 5 MB.");
+    const type = fileKindOf(name);
+    file = { name, mime: mimeOf(name, req.body.file.mimeType), bytes, size: bytes.length, type, description: `${type} study resource` };
+  }
+  if (!text && !file) throw new HttpError(400, "Write a message or attach a file.");
+
+  // What can the moderator see of the file?
+  let fileContent: string | undefined;
+  let fileBase64: string | undefined;
+  if (file) {
+    let bytes = file.bytes;
+    const ext = file.name.split(".").pop()?.toLowerCase() || "";
+    const isText = file.mime.startsWith("text/") || TEXT_EXTENSIONS.includes(ext);
+    const isImage = file.mime.startsWith("image/");
+    if (!bytes && file.copyFrom && (isText || isImage) && file.size <= MAX_FILE_BYTES) {
+      [bytes] = await bucket.file(file.copyFrom).download();
+    }
+    if (bytes && isText) fileContent = bytes.toString("utf8").slice(0, 15000);
+    if (bytes && isImage) fileBase64 = bytes.toString("base64");
+  }
+
+  const decision = await moderate({
     text,
-    fileUrl,
-    fileName,
-    fileType,
-    fileDescription,
-    timestamp: new Date().toISOString(),
-  };
-
-  dbPendingMessages.push(pendingMsg);
-  
-  addLog("PENDING", `New pending message sent by ${sender.name} to ${targetName}`, {
-    messageId: msgId,
-    text: text || "[File/Resource Only]",
-    fileName,
-    fileType,
-    fileDescription,
+    fileName: file?.name,
+    fileType: file?.type,
+    fileDescription: file?.description,
+    fileContent,
+    fileBase64,
+    fileMime: file?.mime,
+    isDM: !group,
+    friendlyPoliteFilter: !group && friendlyPoliteFilter,
+    groupName: group?.name,
+    groupDescription: group?.description,
   });
+  const targetName = group ? `group "${group.name}"` : `@${recipient!.username}`;
+  const now = new Date().toISOString();
 
-  // 2. Trigger Simulated Cloud Function moderation
-  let decision: { status: "APPROVED" | "REJECTED"; explanation: string };
-  const startTime = Date.now();
-  let ytMetadata = "";
-
-  const activeGroup = groupId ? dbGroups.find(g => g.id === groupId) : undefined;
-  const isDM = !groupId;
-
-  // 1. Check for empty/neutral input
-  if (!text?.trim() && !fileName?.trim() && !fileContent?.trim() && !fileBase64?.trim()) {
-    decision = {
-      status: "APPROVED",
-      explanation: "Approved empty or neutral content.",
-    };
+  if (decision.status !== "APPROVED") {
+    const ref = db.collection("notifications").doc();
+    await ref.set({
+      id: ref.id,
+      userId: me.uid,
+      messageId: "",
+      messageText: text || `[File: ${file?.name || "Unnamed"}]`,
+      explanation: (forwardedFrom ? "[Forward rejected] " : "") + decision.explanation,
+      timestamp: now,
+    });
+    await writeLog(me.uid, "REJECTED", `Message to ${targetName} was not delivered (${decision.latencyMs}ms).`, { reason: decision.explanation });
+    return res.json({ status: "REJECTED", explanation: decision.explanation, latencyMs: decision.latencyMs, geminiActive: decision.geminiActive });
   }
-  // 2. Check for custom inorganic chemistry override
-  else if (text && (text.toLowerCase().includes("let's study inorganic chem from alice's account to bob's account") || text.toLowerCase() === "let's study inorganic chem from alice's account to bob's account")) {
-    decision = {
-      status: "APPROVED",
-      explanation: "Approved: The query explicitly focuses on Inorganic Chemistry study, assignments, and educational accounts mapping, which is fully aligned with approved academic collaboration policies.",
-    };
-  }
-  else {
-    // Prior to moderation: extract and fetch YouTube metadata
-    ytMetadata = await extractAndFetchYouTubeMetadata(text || "");
 
-    if (ai && !isGeminiQuotaActive()) {
-      try {
-        addLog("INFO", `Triggering active Gatekeeper Cloud Function. Querying Gemini 3.5 Flash...`, { messageId: msgId });
-        
-        let contents: any[] = [];
-        let systemInstruction = "";
-        let promptText = "";
-
-        if (isDM) {
-          systemInstruction = "You are an AI Moderator for a direct private chat. Always approve standard polite conversational messages unless they contain extremely harmful, illegal, or dangerous content.";
-          promptText = `Message: "${text || "None"}"`;
-        } else {
-          const effectiveName = activeGroup?.name || "General";
-          const effectiveDesc = activeGroup?.description || "No description provided.";
-          systemInstruction = `You are an AI Gatekeeper Moderator for a custom chat group named "${effectiveName}" with description: "${effectiveDesc}".
-The core rule is that ALL substantive discussion must strictly match and align with the group's topic: "${effectiveName}" (and its description).
-You must REJECT any message, file, or link that deviates from this topic or introduces off-topic substance.
-- Minor social greetings, check-ins, or brief coordination (e.g. 'hello', 'how are you', 'sounds good', 'yes', 'perfect', 'okay', 'ready', 'sure', 'got it', 'thanks') are fully ALLOWED and should be APPROVED to preserve natural conversational flow.
-- However, substantive discussions on off-topic subjects are REJECTED.
-- If REJECTED, return REJECTED along with a brief, polite, helpful explanation of why the message is off-topic for this specific group.`;
-
-          let scannedFileInfo = "";
-          if (fileContent) {
-            scannedFileInfo = `\n- Scanned File Contents:\n"""\n${fileContent}\n"""`;
-          }
-
-          promptText = `Evaluate this chat post to see if it stays on-topic for the group "${effectiveName}" (Topic Description: "${effectiveDesc}"):
-- Message Text: "${text || "None provided"}"
-- Attachment Name: "${fileName || "None"}"
-- Attachment Type: "${fileType || "None"}"${scannedFileInfo}${ytMetadata}
-
-Determine whether to APPROVE (on-topic or polite greeting) or REJECT (substantive off-topic deviation).`;
-        }
-
-        if (fileBase64) {
-          const fileExt = fileName ? fileName.split('.').pop()?.toLowerCase() || "jpeg" : "jpeg";
-          const mimeType = fileExt === "png" ? "image/png" : "image/jpeg";
-          contents = [
-            {
-              inlineData: {
-                mimeType: mimeType,
-                data: fileBase64,
-              },
-            },
-            {
-              text: `${promptText}\nNote: Check if the content of this attached image is also relevant to the group's topic or respectful/friendly.`,
-            }
-          ];
-        } else {
-          contents = [promptText];
-        }
-
-        const response = await generateContentWithRetry(ai, {
-          model: "gemini-3.5-flash",
-          contents: contents,
-          config: {
-            systemInstruction: systemInstruction,
-            responseMimeType: "application/json",
-            temperature: 0.1,
-            maxOutputTokens: 150,
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                status: {
-                  type: Type.STRING,
-                  enum: ["APPROVED", "REJECTED"],
-                  description: "APPROVED if the content matches group topic / is friendly, REJECTED if off-topic or rude.",
-                },
-                explanation: {
-                  type: Type.STRING,
-                  description: "If REJECTED, a brief explanation of why the message failed moderation. Keep brief or empty if APPROVED.",
-                },
-              },
-              required: ["status", "explanation"],
-            },
-          },
-        });
-
-        const responseText = response.text || "{}";
-        const result = JSON.parse(responseText.trim());
-        decision = {
-          status: result.status || "REJECTED",
-          explanation: result.explanation || (result.status === "APPROVED" ? "Approved by Gatekeeper AI." : "No explanation provided."),
+  // Reply context comes from the stored message, not from the client.
+  let reply: Partial<Message> = {};
+  if (replyToId) {
+    const r = await db.collection("messages").doc(String(replyToId)).get();
+    if (r.exists) {
+      const rm = r.data() as Message;
+      if (await canRead(me.uid, rm)) {
+        reply = {
+          replyToId: rm.id,
+          replyToSenderName: rm.senderName,
+          replyToText: rm.text || (rm.fileName ? `[Attached ${rm.fileType}]` : "Attachment"),
         };
-      } catch (err: any) {
-        console.error("Gemini moderation error:", err);
-        addLog("INFO", `Gemini API call failed. Using local fail-safe evaluation fallback. Error: ${err.message}`, { messageId: msgId });
-        decision = runFallbackModeration(text || "", fileName, fileDescription, fileContent, ytMetadata, activeGroup?.name, activeGroup?.description, isDM, false);
       }
-    } else {
-      // Falls back to regex-based heuristics when API key is missing or quota is exhausted
-      const fallbackReason = !ai 
-        ? "GEMINI_API_KEY is not configured in Secrets." 
-        : "Gemini API daily quota is currently exhausted.";
-      addLog("INFO", `${fallbackReason} Running high-fidelity local regex evaluation...`, { messageId: msgId });
-      decision = runFallbackModeration(text || "", fileName, fileDescription, fileContent, ytMetadata, activeGroup?.name, activeGroup?.description, isDM, false);
     }
   }
 
-  const durationMs = Date.now() - startTime;
-
-  // 3. Process Evaluation Decision
-  
-  // Remove from pending_messages
-  dbPendingMessages = dbPendingMessages.filter(m => m.id !== msgId);
-
-  if (decision.status === "APPROVED") {
-    // Move to messages collection
-    const approvedMsg: Message = {
-      ...pendingMsg,
-      id: `msg_approved_${Date.now()}`,
-      approvedAt: new Date().toISOString(),
-    };
-    dbMessages.push(approvedMsg);
-    
-    addLog("APPROVED", `Gatekeeper approved message to ${targetName} (${durationMs}ms)`, {
-      messageId: approvedMsg.id,
-      text: approvedMsg.text,
-      decision,
-    });
-
-    res.json({
-      success: true,
-      status: "APPROVED",
-      message: approvedMsg,
-      explanation: decision.explanation,
-      latencyMs: durationMs,
-      geminiActive: !!ai && !isGeminiQuotaActive(),
-    });
-  } else {
-    // Write private Warning Notification to user
-    const warningId = `warn_${Date.now()}`;
-    const warning: Notification = {
-      id: warningId,
-      userId: senderId,
-      messageId: msgId,
-      messageText: text || `[File: ${fileName || "Unnamed"}]`,
-      explanation: decision.explanation,
-      timestamp: new Date().toISOString(),
-    };
-    dbNotifications.push(warning);
-
-    addLog("REJECTED", `Gatekeeper rejected message by ${sender.name} (${durationMs}ms). Private warning sent.`, {
-      messageId: msgId,
-      reason: decision.explanation,
-      decision,
-    });
-
-    res.json({
-      success: false,
-      status: "REJECTED",
-      explanation: decision.explanation,
-      latencyMs: durationMs,
-      geminiActive: !!ai && !isGeminiQuotaActive(),
-    });
-  }
-});
-
-// 14. AI Message & File Content Search API
-app.post("/api/search-messages", async (req, res) => {
-  const { query, messages: candidateMessages = [], fileTypeFilter = "all" } = req.body;
-
-  if (!query || typeof query !== "string" || !query.trim()) {
-    return res.status(400).json({ error: "Search query string is required." });
+  const ref = db.collection("messages").doc();
+  let filePath: string | undefined;
+  if (file) {
+    filePath = `attachments/${ref.id}/${file.name}`;
+    if (file.bytes) {
+      await bucket.file(filePath).save(file.bytes, { contentType: file.mime, resumable: false });
+    } else if (file.copyFrom) {
+      await bucket.file(file.copyFrom).copy(bucket.file(filePath));
+    }
   }
 
-  const queryClean = query.trim().toLowerCase();
+  const msg: Message = clean({
+    id: ref.id,
+    kind: group ? "group" : "dm",
+    groupId: group?.id,
+    recipientId: recipient?.uid,
+    participants: recipient ? [me.uid, recipient.uid] : undefined,
+    dmKey: recipient ? dmKeyOf(me.uid, recipient.uid) : undefined,
+    audience: group ? group.members : [me.uid, recipient!.uid],
+    senderId: me.uid,
+    senderName: me.name,
+    text,
+    fileName: file?.name,
+    fileType: file?.type,
+    fileDescription: file?.description,
+    fileMime: file?.mime,
+    fileSize: file?.size,
+    filePath,
+    timestamp: now,
+    approvedAt: now,
+    friendlyPoliteFilter: recipient ? friendlyPoliteFilter : undefined,
+    isForwarded: forwardedFrom ? true : undefined,
+    originalSenderName: forwardedFrom ? forwardedFrom.originalSenderName || forwardedFrom.senderName : undefined,
+    ...reply,
+  }) as Message;
+  await ref.set(msg);
+  await writeLog(me.uid, "APPROVED", `${forwardedFrom ? "Forwarded message" : "Message"} delivered to ${targetName} (${decision.latencyMs}ms).`, { messageId: ref.id });
+  res.json({ status: "APPROVED", message: msg, explanation: decision.explanation, latencyMs: decision.latencyMs, geminiActive: decision.geminiActive });
+}));
+
+// Delete your own message (and its attachment).
+app.delete("/api/messages/:id", verified, routeE(async (req, res) => {
+  const ref = db.collection("messages").doc(req.params.id);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpError(404, "Message not found.");
+  const msg = snap.data() as Message;
+  if (msg.senderId !== req.user.uid) throw new HttpError(403, "You can only delete your own messages.");
+  await ref.delete();
+  if (msg.filePath) await bucket.file(msg.filePath).delete({ ignoreNotFound: true });
+  await writeLog(req.user.uid, "INFO", "Deleted a message.", { messageId: msg.id });
+  res.json({ success: true });
+}));
+
+// Download an attachment (only for people who can read the message).
+app.get("/api/messages/:id/file", verified, routeE(async (req, res) => {
+  const snap = await db.collection("messages").doc(req.params.id).get();
+  if (!snap.exists) throw new HttpError(404, "Message not found.");
+  const msg = snap.data() as Message;
+  if (!msg.filePath) throw new HttpError(404, "This message has no attachment.");
+  if (!(await canRead(req.user.uid, msg))) throw new HttpError(403, "You can't open this file.");
+  const f = bucket.file(msg.filePath);
+  const [exists] = await f.exists();
+  if (!exists) throw new HttpError(404, "The file is no longer available.");
+  res.setHeader("Content-Type", msg.fileMime || "application/octet-stream");
+  res.setHeader("Content-Disposition", `inline; filename="${(msg.fileName || "file").replace(/"/g, "")}"`);
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  f.createReadStream().on("error", () => res.end()).pipe(res);
+}));
+
+// Search messages and files the caller can read.
+app.post("/api/search-messages", verified, routeE(async (req, res) => {
+  const uid = req.user.uid;
+  const { query, fileTypeFilter = "all", scope = "current", groupId, recipientId } = req.body;
+  if (!query || typeof query !== "string" || !query.trim()) throw new HttpError(400, "Search query string is required.");
   const startTime = Date.now();
+  const me = await getProfile(uid);
 
-  // Combine server dbMessages with any client candidate messages to ensure full coverage
-  const allCandidatesMap = new Map<string, Message>();
-  dbMessages.forEach(m => allCandidatesMap.set(m.id, m));
-  if (Array.isArray(candidateMessages)) {
-    candidateMessages.forEach((m: Message) => {
-      if (m && m.id) allCandidatesMap.set(m.id, m);
-    });
+  const found = new Map<string, Message>();
+  const add = (snap: FirebaseFirestore.QuerySnapshot) => snap.forEach((d) => found.set(d.id, d.data() as Message));
+  const groupIds: string[] = scope === "all" ? me.groups : groupId ? [String(groupId)] : [];
+  for (const gid of groupIds) {
+    await getGroupForMember(gid, uid);
+    add(await db.collection("messages").where("groupId", "==", gid).orderBy("timestamp", "asc").limitToLast(300).get());
+  }
+  if (scope === "all") {
+    add(await db.collection("messages").where("participants", "array-contains", uid).limit(500).get());
+  } else if (recipientId) {
+    add(await db.collection("messages").where("dmKey", "==", dmKeyOf(uid, String(recipientId))).orderBy("timestamp", "asc").limitToLast(300).get());
   }
 
-  let candidates = Array.from(allCandidatesMap.values());
-
-  // Apply file filter if requested
-  if (fileTypeFilter === "files") {
-    candidates = candidates.filter(m => !!(m.fileName || m.fileUrl || m.fileType || m.fileDescription));
-  } else if (fileTypeFilter === "text") {
-    candidates = candidates.filter(m => !m.fileName && !!m.text);
-  }
-
+  let candidates = Array.from(found.values());
+  if (fileTypeFilter === "files") candidates = candidates.filter((m) => !!m.fileName);
+  else if (fileTypeFilter === "text") candidates = candidates.filter((m) => !m.fileName && !!m.text);
   if (candidates.length === 0) {
-    return res.json({
-      success: true,
-      results: [],
-      aiExplanation: "No messages found matching the filter criteria.",
-      latencyMs: Date.now() - startTime,
-    });
+    return res.json({ success: true, results: [], aiExplanation: "No messages found matching the filter criteria.", latencyMs: Date.now() - startTime });
   }
+  res.json(await rankMessages(query, query.trim().toLowerCase(), candidates, startTime));
+}));
 
+async function rankMessages(query: string, queryClean: string, candidates: Message[], startTime: number) {
   // Attempt Gemini AI Semantic Ranking & Search
   if (ai && !isGeminiQuotaActive()) {
     try {
@@ -1068,7 +928,7 @@ Identify the top matching messages/files for the query. Include relevance score 
         })
         .filter(Boolean);
 
-      return res.json({
+      return ({
         success: true,
         results: structuredResults,
         aiExplanation: resultData.aiExplanation || `Found ${structuredResults.length} matching message(s) via Gemini AI.`,
@@ -1153,7 +1013,7 @@ Identify the top matching messages/files for the query. Include relevance score 
 
   const isFileQuery = queryClean.includes("file") || queryClean.includes("pdf") || queryClean.includes("doc") || queryClean.includes("notes") || queryClean.includes("image") || queryClean.includes("video") || queryClean.includes("attachment");
   
-  return res.json({
+  return ({
     success: true,
     results: scoredResults,
     aiExplanation: scoredResults.length > 0
@@ -1161,28 +1021,24 @@ Identify the top matching messages/files for the query. Include relevance score 
       : `No messages or files found matching "${query.trim()}".`,
     latencyMs: Date.now() - startTime,
     geminiActive: false,
-  });
-});
-
+  });}
 
 // Serve React build in production, otherwise Vite handles development
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Gatekeeper Applet Server running on http://localhost:${PORT}`);
+    console.log(`Gatekeeper server running on http://localhost:${PORT}`);
   });
 }
 

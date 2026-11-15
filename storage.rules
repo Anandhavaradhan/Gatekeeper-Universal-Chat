@@ -1,0 +1,10 @@
+rules_version = '2';
+
+// Attachments are uploaded and served only by the server (GET /api/messages/:id/file checks access).
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -2,10 +2,9 @@ export interface User {
   uid: string;
   name: string;
   username: string;
-  password?: string;
   email?: string;
-  emailVerified?: boolean;
   groups: string[];
+  createdAt?: string;
 }
 
 export interface Group {
@@ -14,18 +13,25 @@ export interface Group {
   description: string;
   members: string[];
   createdBy?: string;
+  createdAt?: string;
 }
 
 export interface Message {
   id: string;
+  kind?: "group" | "dm";
   groupId?: string; // Optional for direct messages
   recipientId?: string; // Set for one-on-one direct messages
   senderId: string;
   senderName: string;
-  senderEmail?: string;
+  participants?: string[]; // DMs: the two people
+  dmKey?: string;
+  audience?: string[];
   text?: string;
   fileUrl?: string;
   fileName?: string;
+  fileMime?: string;
+  fileSize?: number;
+  filePath?: string;
   fileType?: "PDF" | "Video" | "Image" | "Word" | "PPT" | "YouTube" | "Other";
   fileDescription?: string;
   timestamp: string;
