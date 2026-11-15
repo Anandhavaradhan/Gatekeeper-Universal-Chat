@@ -92,9 +92,9 @@ Host the container, then build the apps to point at it:
    ```
    Then add the service's address in the Firebase console under Authentication → Settings → Authorized domains.
 2. **Build the apps.** In GitHub: Actions → **Gatekeeper Chat apps** → Run workflow, and enter the hosted address.
-   The APK and the Windows .exe are published as the `gatekeeperchat-latest` release:
-   - `https://github.com/Anandhavaradhan/Gatekeeper-Universal-Chat/releases/download/gatekeeperchat-latest/GatekeeperChat.apk`
-   - `https://github.com/Anandhavaradhan/Gatekeeper-Universal-Chat/releases/download/gatekeeperchat-latest/GatekeeperChat.exe`
+   The APK and the Windows .exe are published to the `downloads` branch:
+   - `https://github.com/Anandhavaradhan/Gatekeeper-Universal-Chat/raw/downloads/GatekeeperChat.apk`
+   - `https://github.com/Anandhavaradhan/Gatekeeper-Universal-Chat/raw/downloads/GatekeeperChat.exe`
 
 The apps (`android/`, `desktop/`) are thin shells that open the hosted site.
 

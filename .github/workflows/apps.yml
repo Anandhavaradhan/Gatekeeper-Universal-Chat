@@ -1,7 +1,7 @@
-# Builds Gatekeeper Chat as an Android APK and a Windows .exe, and publishes both as a GitHub Release
-# (from main, or when run by hand). The download links stay the same for every release:
-#   https://github.com/<owner>/<repo>/releases/download/gatekeeperchat-latest/GatekeeperChat.apk
-#   https://github.com/<owner>/<repo>/releases/download/gatekeeperchat-latest/GatekeeperChat.exe
+# Builds Gatekeeper Chat as an Android APK and a Windows .exe, and publishes both to the "downloads" branch
+# (from main, or when run by hand). The download links stay the same for every build:
+#   https://github.com/<owner>/<repo>/raw/downloads/GatekeeperChat.apk
+#   https://github.com/<owner>/<repo>/raw/downloads/GatekeeperChat.exe
 name: Gatekeeper Chat apps
 
 on:
@@ -74,10 +74,24 @@ jobs:
         with:
           path: files
           merge-multiple: true
-      - name: Publish the release (replaces the previous one, so the links never change)
+      # The newest files are always at:
+      #   https://github.com/<owner>/<repo>/raw/downloads/GatekeeperChat.apk
+      #   https://github.com/<owner>/<repo>/raw/downloads/GatekeeperChat.exe
+      - name: Publish to the downloads branch
+        run: |
+          cd files
+          ls -la
+          printf '# Downloads\n\nBuild ${{ github.run_number }} of Gatekeeper Chat, from commit ${{ github.sha }}.\n' > README.md
+          git init -q -b downloads
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com add .
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -qm "Gatekeeper Chat apps, build ${{ github.run_number }} (${{ github.sha }})"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" downloads
+      - name: Also publish as a GitHub Release (GitHub refuses this for some accounts; the branch above is enough)
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          rm -rf files/.git files/README.md
           gh release delete "gatekeeperchat-latest" --repo "${{ github.repository }}" --cleanup-tag --yes || true
           sleep 5
           gh release create "gatekeeperchat-latest" files/* \
