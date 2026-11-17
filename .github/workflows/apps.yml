@@ -78,13 +78,15 @@ jobs:
       #   https://github.com/<owner>/<repo>/raw/downloads/GatekeeperChat.apk
       #   https://github.com/<owner>/<repo>/raw/downloads/GatekeeperChat.exe
       - name: Publish to the downloads branch
+        env:
+          APP_NAME: Gatekeeper Chat
         run: |
           cd files
           ls -la
-          printf '# Downloads\n\nBuild ${{ github.run_number }} of Gatekeeper Chat, from commit ${{ github.sha }}.\n' > README.md
+          printf '# Downloads\n\nBuild %s of %s, from commit %s.\n' "${{ github.run_number }}" "$APP_NAME" "${{ github.sha }}" > README.md
           git init -q -b downloads
           git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com add .
-          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -qm "Gatekeeper Chat apps, build ${{ github.run_number }} (${{ github.sha }})"
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -qm "$APP_NAME apps, build ${{ github.run_number }} (${{ github.sha }})"
           git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" downloads
       - name: Also publish as a GitHub Release (GitHub refuses this for some accounts; the branch above is enough)
         continue-on-error: true
