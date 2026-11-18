@@ -59,8 +59,9 @@ Without these, every read is refused and the DM and alert queries fail:
 
 ```bash
 npx firebase-tools login
-npx firebase-tools deploy --only firestore,storage --project <new-project-id>
+npx firebase-tools deploy --only firestore,storage --project focus-apps
 ```
+(use whatever project ID the console actually assigned, e.g. `focus-apps` or `focus-apps-xxxxx`)
 
 `firestore.rules` lets people read only the groups and DMs they belong to, and blocks direct writes.
 `storage.rules` blocks the browser from the bucket entirely. `firestore.indexes.json` holds the four
