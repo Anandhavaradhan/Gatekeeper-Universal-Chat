@@ -60,6 +60,9 @@ npm install
 
 ## 🔥 Firebase setup
 
+Setting the app up on a new Firebase project, step by step:
+see **[FIREBASE-SETUP.md](FIREBASE-SETUP.md)**. The short version:
+
 1. In the Firebase console for the project in `firebase-applet-config.json`, turn on **Authentication → Sign-in method → Email/Password**.
 2. Deploy the rules and indexes (the Firestore database id is set in `firebase.json`):
    ```bash
