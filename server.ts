@@ -59,6 +59,30 @@ function isTemporaryEmail(email: string): boolean {
 let ai: GoogleGenAI | null = null;
 const API_KEY = process.env.GEMINI_API_KEY;
 
+// The last refusal from Gemini, so a wrong key or a retired model shows up in /api/config
+// instead of quietly turning into local moderation. Checked by: npm run check:gemini
+let lastGeminiError: { message: string; at: string } | null = null;
+// null until the startup check has answered; then whether Gemini really replies.
+let geminiVerified: boolean | null = null;
+function noteGeminiError(err: unknown) {
+  let raw = err instanceof Error ? err.message : String(err);
+  // The SDK often hands back the API's whole JSON body; keep just the sentence that explains it.
+  const brace = raw.indexOf("{");
+  if (brace >= 0) {
+    try {
+      const parsed = JSON.parse(raw.slice(brace));
+      if (parsed?.error?.message) raw = `${parsed.error.message} (${parsed.error.status || parsed.error.code})`;
+    } catch {
+      /* not JSON after all, keep the original text */
+    }
+  }
+  lastGeminiError = {
+    // An API error can echo the request URL back, key and all.
+    message: raw.replace(/key=[\w-]+/g, "key=REDACTED").replace(/AIza[\w-]{10,}/g, "AIza…REDACTED").slice(0, 300),
+    at: new Date().toISOString(),
+  };
+}
+
 let geminiQuotaExceeded = false;
 let quotaExceededTime = 0;
 const QUOTA_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes cooldown before trying Gemini again
@@ -85,6 +109,25 @@ if (API_KEY && API_KEY !== "MY_GEMINI_API_KEY") {
       },
     });
     console.log("Gemini API initialized successfully.");
+    // Ask Gemini one tiny question at startup, so a wrong key or a retired model is known
+    // before the first message rather than silently becoming local moderation.
+    void (async () => {
+      try {
+        await ai!.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: ["Reply with the single word: ok"],
+          config: { maxOutputTokens: 5, temperature: 0 },
+        });
+        geminiVerified = true;
+        lastGeminiError = null;
+        console.log("Gemini key and model verified.");
+      } catch (err) {
+        geminiVerified = false;
+        noteGeminiError(err);
+        console.warn("Gemini refused the startup check, so moderation will use the local fallback.");
+        console.warn("Run `npm run check:gemini` to see why. Reason:", lastGeminiError?.message);
+      }
+    })();
   } catch (err) {
     console.error("Error initializing Gemini client:", err);
   }
@@ -113,6 +156,8 @@ async function generateContentWithRetry(aiClient: any, params: any, maxRetries =
         const response = await aiClient.models.generateContent(params);
         // Successful call, reset any quota indicators
         geminiQuotaExceeded = false;
+        lastGeminiError = null;
+        geminiVerified = true;
         return response;
       } catch (err: any) {
         lastError = err;
@@ -543,6 +588,7 @@ Determine whether to APPROVE (on-topic or polite greeting) or REJECT (substantiv
     });
   } catch (err) {
     console.error("Gemini evaluation error, using fallback moderation:", err);
+    noteGeminiError(err);
     return done(fallback());
   }
 }
@@ -551,7 +597,18 @@ Determine whether to APPROVE (on-topic or polite greeting) or REJECT (substantiv
 
 app.get("/api/config", (_req, res) => {
   const quota = isGeminiQuotaActive();
-  res.json({ geminiActive: !!ai && !quota, apiModel: "gemini-3.5-flash", fallbackEnabled: !ai || quota });
+  // A key that has already been refused is not active, so the app shows local moderation honestly.
+  const active = !!ai && !quota && geminiVerified !== false;
+  res.json({
+    geminiActive: active,
+    apiModel: "gemini-3.5-flash",
+    fallbackEnabled: !active,
+    keyConfigured: !!ai,
+    // null while the startup check is still running.
+    keyVerified: geminiVerified,
+    // Why Gemini was last refused, if it was. null once a call succeeds.
+    lastError: lastGeminiError,
+  });
 });
 
 // Create the signed-in user's profile (allowed before email verification, so sign-up can do it).

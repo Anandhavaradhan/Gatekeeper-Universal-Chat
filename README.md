@@ -103,6 +103,30 @@ The apps (`android/`, `desktop/`) are thin shells that open the hosted site.
 
 ---
 
+## 🔑 Checking the Gemini key
+
+```bash
+GEMINI_API_KEY=<your key> npm run check:gemini
+```
+
+It asks Google which models the key can see, then calls each model this app uses
+(`gemini-3.5-flash`, falling back to `gemini-3.1-flash-lite`) and reports each one. The key is never
+printed, and an error that echoes it back is redacted.
+
+The server also checks the key once at startup. `GET /api/config` then reports:
+
+| Field | Meaning |
+|---|---|
+| `keyConfigured` | a key was supplied |
+| `keyVerified` | `true` if Gemini answered, `false` if it refused, `null` while checking |
+| `lastError` | why it was refused, as one sentence |
+| `geminiActive` | false once a key has been refused, so the app shows local moderation honestly |
+
+Without a working key the app still runs: moderation falls back to keyword and topic rules, which is
+blunter but never blocks sending.
+
+---
+
 ## 📄 License
 
 MIT License. Built for Gatekeeper Universal Chat.
