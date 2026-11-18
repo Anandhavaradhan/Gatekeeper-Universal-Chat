@@ -4,17 +4,17 @@ Gatekeeper signs people in with email and password, keeps groups and messages in
 attachments in Cloud Storage. The server writes all of it with the Firebase Admin SDK after moderating the
 message, so it needs credentials of its own.
 
-Gatekeeper and [TopicPulse](https://github.com/Anandhavaradhan/focuschat) are meant to share one project,
-each with its own Firestore database, so their collections never collide. Both apps write a `users`
-collection, so they must not share a database.
+Gatekeeper has its own Firebase project (free Spark plan), separate from
+[TopicPulse](https://github.com/Anandhavaradhan/focuschat)'s. Both apps write a `users` collection, so
+keeping them in separate projects avoids any chance of collision.
 
 ## 1. In the Firebase console
 
 **Create the project**, then:
 
 ### Firestore
-Create the first database (the console calls it `(default)`) in a region close to you, in **production mode**.
-That is the one Gatekeeper uses. TopicPulse then adds a second one named `topicpulse`.
+Create the database (the console calls it `(default)`) in a region close to you, in **production mode**.
+That is the one Gatekeeper uses.
 
 ### Storage
 **Build → Storage → Get started.** Accept the default bucket. Gatekeeper keeps message attachments there,
